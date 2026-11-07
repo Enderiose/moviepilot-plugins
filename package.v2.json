@@ -1,0 +1,478 @@
+{
+  "SiteDailyStatistic": {
+    "name": "站点每日数据统计",
+    "description": "站点统计数据图表及当天累计站点数据通知",
+    "labels": "",
+    "version": "4.0",
+    "icon": "Collabora_A.png",
+    "author": "Xiang",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "4.0": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "AutoSignIn": {
+    "name": "站点自动签到",
+    "description": "自动模拟登录、签到站点。",
+    "labels": "",
+    "version": "2.9.15",
+    "icon": "signin.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.9.15": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "CloudflareSpeedTest": {
+    "name": "Cloudflare IP优选",
+    "description": "🌩 测试 Cloudflare CDN 延迟和速度，自动优选IP。",
+    "labels": "",
+    "version": "1.5.1",
+    "icon": "cloudflare.jpg",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.5.1": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "DoubanSync": {
+    "name": "豆瓣想看",
+    "description": "同步豆瓣想看数据，自动添加订阅。",
+    "labels": "",
+    "version": "2.1.1",
+    "icon": "douban.png",
+    "author": "jxxghp,dwhmofly",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.1.1": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "LibraryScraper": {
+    "name": "媒体库刮削",
+    "description": "定时对媒体库进行刮削，补齐缺失元数据和图片。",
+    "labels": "",
+    "version": "2.1.4",
+    "icon": "scraper.png",
+    "author": "jxxghp",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.1.4": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "AdaptiveIntroSkip": {
+    "name": "自适应IntroSkip",
+    "description": "自适应生成IntroSkip片头片尾标记，Emby跳片头、片尾",
+    "labels": "",
+    "version": "1.7.8",
+    "icon": "https://raw.githubusercontent.com/honue/MoviePilot-Plugins/main/icons/chapter.png",
+    "author": "honue",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.7.8": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "CustomHosts": {
+    "name": "自定义Hosts",
+    "description": "修改系统hosts文件，加速网络访问。",
+    "labels": "",
+    "version": "1.2.2",
+    "icon": "hosts.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.2.2": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "RemoteIdentifiers": {
+    "name": "共享识别词",
+    "description": "从Github、Etherpad远程文件中获取共享识别词并应用",
+    "labels": "",
+    "version": "2.4.1",
+    "icon": "words.png",
+    "author": "honue",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.4.1": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "MediaServerRefresh": {
+    "name": "媒体库服务器刷新",
+    "description": "入库后自动刷新Emby/Jellyfin/Plex服务器海报墙。",
+    "labels": "",
+    "version": "1.3.3",
+    "icon": "refresh2.png",
+    "author": "jxxghp",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.3.3": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "MediaServerMsg": {
+    "name": "媒体库服务器通知",
+    "description": "发送Emby/Jellyfin/Plex服务器的播放、入库等通知消息。",
+    "labels": "",
+    "version": "1.8.6",
+    "icon": "mediaplay.png",
+    "author": "jxxghp",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.8.6": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "IYUUAutoSeed": {
+    "name": "IYUU自动辅种",
+    "description": "基于IYUU官方Api实现自动辅种。",
+    "labels": "",
+    "version": "2.22",
+    "icon": "IYUU.png",
+    "author": "jxxghp,CKun",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.22": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "IyuuAuth": {
+    "name": "IYUU站点绑定",
+    "description": "为IYUU账号绑定认证站点，以便用于用户认证和辅种。",
+    "labels": "",
+    "version": "1.2",
+    "icon": "Iyuu_A.png",
+    "author": "jxxghp",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.2": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "WeWorkIPPW": {
+    "name": "企微配置IPpw版",
+    "description": "!!docker用户用这个版本!!定时获取最新动态公网IP，配置到企业微信应用的可信IP列表里。",
+    "labels": "",
+    "version": "2.4.2",
+    "icon": "https://github.com/suraxiuxiu/MoviePilot-Plugins/blob/main/icons/micon.png?raw=true",
+    "author": "suraxiuxiu",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.4.2": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "PersonMeta": {
+    "name": "演职人员刮削",
+    "description": "刮削演职人员图片以及中文名称。",
+    "labels": "",
+    "version": "2.2.5",
+    "icon": "actor.png",
+    "author": "jxxghp",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.2.5": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "ShortPlayMonitor": {
+    "name": "短剧刮削",
+    "description": "监控视频短剧创建，刮削。",
+    "labels": "",
+    "version": "4.0.4",
+    "icon": "Amule_B.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "4.0.4": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "SubscribeGroup": {
+    "name": "订阅规则自动填充",
+    "description": "电视剧下载后自动添加官组等信息到订阅；添加订阅后根据二级分类名称自定义订阅规则。",
+    "labels": "",
+    "version": "2.8.7",
+    "icon": "teamwork.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.8.7": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "SubscribeStatistic": {
+    "name": "订阅下载统计",
+    "description": "统计指定时间内各站点订阅及下载情况。",
+    "labels": "",
+    "version": "1.6",
+    "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/subscribestatistic.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.6": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "SubscribeReminder": {
+    "name": "订阅提醒",
+    "description": "推送当天订阅更新内容。",
+    "labels": "",
+    "version": "1.5",
+    "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/subscribe_reminder.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.5": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "BrushFlowLowFreq": {
+    "name": "站点刷流（低频版）",
+    "description": "自动托管刷流，将会提高对应站点的访问频率。（基于官方插件BrushFlow二次开发）",
+    "labels": "",
+    "version": "4.3.3",
+    "icon": "brush.jpg",
+    "author": "jxxghp,InfinityPacer",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "4.3.3": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "TrendingShow": {
+    "name": "流行趋势轮播",
+    "description": "在仪表板中显示流行趋势海报轮播图。",
+    "labels": "",
+    "version": "1.3",
+    "icon": "TrendingShow.jpg",
+    "author": "jxxghp",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.3": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "AutoBackup": {
+    "name": "自动备份",
+    "description": "自动备份数据和配置文件。",
+    "labels": "",
+    "version": "2.1.4",
+    "icon": "Time_machine_B.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.1.4": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "TorrentTransfer": {
+    "name": "自动转移做种",
+    "description": "定期转移下载器中的做种任务到另一个下载器。",
+    "labels": "",
+    "version": "1.10.3",
+    "icon": "seed.png",
+    "author": "jxxghp",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.10.3": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "MPServerStatus": {
+    "name": "MoviePilot服务监控",
+    "description": "在仪表板中实时显示MoviePilot公共服务器状态。",
+    "labels": "",
+    "version": "1.4",
+    "icon": "Duplicati_A.png",
+    "author": "jxxghp",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.4": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "DailyWord": {
+    "name": "每日一言",
+    "description": "在仪表板中显示每日一言卡片。",
+    "labels": "",
+    "version": "1.2",
+    "icon": "Calibre_B.png",
+    "author": "jxxghp",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.2": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "TorrentTransferEnhanced": {
+    "name": "转移做种增强",
+    "description": "支持暂停和未完成的种子定时转移做种。",
+    "labels": "",
+    "version": "0.1",
+    "icon": "https://raw.githubusercontent.com/cancelpt/MoviePilot-Plugins/refs/heads/main/icons/fruit.png",
+    "author": "jxxghp,cancelpt",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "0.1": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "DouBanWatching": {
+    "name": "豆瓣书影音档案",
+    "description": "将剧集电影的在看、看完状态同步到豆瓣书影音档案。",
+    "labels": "",
+    "version": "1.9.9",
+    "icon": "douban.png",
+    "author": "honue",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.9.9": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "MoviePilotUpdateNotify": {
+    "name": "MoviePilot更新推送",
+    "description": "MoviePilot推送release更新通知、自动重启。",
+    "labels": "",
+    "version": "2.3.1",
+    "icon": "Moviepilot_A.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.3.1": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "EmbyActorSync": {
+    "name": "Emby剧集演员同步",
+    "description": "同步剧演员信息到集演员信息。",
+    "labels": "",
+    "version": "1.5",
+    "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/embyactorsync.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.5": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "EmbyMetaTag": {
+    "name": "Emby媒体标签",
+    "description": "自动给媒体库媒体添加标签。",
+    "labels": "",
+    "version": "1.6",
+    "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/tag.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.6": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "PluginAutoUpgrade": {
+    "name": "插件自动升级",
+    "description": "定时检测、升级插件。",
+    "labels": "",
+    "version": "2.4.2",
+    "icon": "https://raw.githubusercontent.com/hotlcc/MoviePilot-Plugins-Third/main/icons/PluginAutoUpgrade.png",
+    "author": "hotlcc",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.4.2": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "EmbyMetaRefresh": {
+    "name": "Emby元数据刷新",
+    "description": "定时刷新Emby媒体库元数据，演职人员中文。",
+    "labels": "",
+    "version": "2.3.3",
+    "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/emby-icon.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "2.3.3": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "SqlExecute": {
+    "name": "Sql执行器",
+    "description": "自定义MoviePilot数据库Sql执行。",
+    "labels": "",
+    "version": "1.4",
+    "icon": "https://raw.githubusercontent.com/thsrite/MoviePilot-Plugins/main/icons/sqlite.png",
+    "author": "thsrite",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.4": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "AutoDiagnosis": {
+    "name": "自动诊断",
+    "description": "自动发起系统健康检查、网络连通性测试以及硬链接检查。",
+    "labels": "",
+    "version": "1.9",
+    "icon": "https://raw.githubusercontent.com/InfinityPacer/MoviePilot-Plugins/main/icons/autodiagnosis.png",
+    "author": "InfinityPacer",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "1.9": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  },
+  "MediaCoverGenerator": {
+    "name": "Emby媒体库封面生成",
+    "description": "生成媒体库动态/静态封面，支持 Emby/Jellyfin",
+    "labels": "",
+    "version": "0.9.7",
+    "icon": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/icons/emby.png",
+    "author": "呀哈哈",
+    "level": 1,
+    "v3": false,
+    "release": true,
+    "history": {
+      "0.9.7": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+    }
+  }
+}
