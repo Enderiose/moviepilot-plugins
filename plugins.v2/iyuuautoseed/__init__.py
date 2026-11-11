@@ -35,7 +35,7 @@ class IYUUAutoSeed(_PluginBase):
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "2.26"
+    plugin_version = "2.27"
     # 插件作者
     plugin_author = "jxxghp,CKun"
     # 作者主页
@@ -95,6 +95,8 @@ class IYUUAutoSeed(_PluginBase):
     _linkroot = "_reseed"
     # 【v2.25】媒体库黑名单（逗号分隔），映射目录命中则不映射
     _linkblock = "Music"
+    # 【v2.27】保存配置时清理全部硬链接映射（一次性开关）
+    _linkclean = False
     # 辅种缓存，出错的种子不再重复辅种，可清除
     _error_caches = []
     # 辅种缓存，辅种成功的种子，可清除
@@ -138,6 +140,7 @@ class IYUUAutoSeed(_PluginBase):
             self._hardlink = bool(config.get("hardlink"))
             self._linkroot = config.get("linkroot") or "_reseed"
             self._linkblock = config.get("linkblock") or "Music"
+            self._linkclean = bool(config.get("linkclean"))
             self._addhosttotag = config.get("addhosttotag")
             self._size = float(config.get("size")) if config.get("size") else 0
             self._clearcache = config.get("clearcache")
@@ -149,6 +152,15 @@ class IYUUAutoSeed(_PluginBase):
             self.__trim_seed_cache(self._permanent_error_caches)
             self.__trim_seed_cache(self._error_caches)
             self.__trim_seed_cache(self._success_caches)
+
+            # 【v2.27】保存配置时清理硬链接映射（一次性开关）
+            if self._linkclean:
+                try:
+                    _result = self.clean_linkmap()
+                    logger.info(f"按配置清理硬链接映射：{_result}")
+                except Exception as _err:
+                    logger.error(f"清理硬链接映射失败：{_err}")
+                self._linkclean = False
 
             # 过滤掉已删除的站点
             all_sites = [site.id for site in SiteOper().list_order_by_pri()] + [site.get("id") for site in
@@ -763,19 +775,11 @@ class IYUUAutoSeed(_PluginBase):
                                                 },
                                                 'content': [
                                                     {
-                                                        'component': 'VBtn',
+                                                        'component': 'VSwitch',
                                                         'props': {
-                                                            'color': 'primary',
-                                                            'variant': 'tonal',
-                                                            'prependIcon': 'mdi-link-variant',
-                                                            'class': 'text-none'
-                                                        },
-                                                        'text': '查看硬链接映射清单',
-                                                        'events': {
-                                                            'click': {
-                                                                'api': 'plugin/IYUUAutoSeed/linkmap',
-                                                                'method': 'get'
-                                                            }
+                                                            'model': 'linkclean',
+                                                            'label': '保存时清理硬链接映射',
+                                                            'messages': '只删插件自己记录过、且位于映射根下的目录（逐文件删除）'
                                                         }
                                                     }
                                                 ]
@@ -784,24 +788,18 @@ class IYUUAutoSeed(_PluginBase):
                                                 'component': 'VCol',
                                                 'props': {
                                                     'cols': 12,
-                                                    'md': 4
+                                                    'md': 8
                                                 },
                                                 'content': [
                                                     {
-                                                        'component': 'VBtn',
+                                                        'component': 'VAlert',
                                                         'props': {
-                                                            'color': 'error',
+                                                            'type': 'info',
                                                             'variant': 'tonal',
-                                                            'prependIcon': 'mdi-link-variant-off',
-                                                            'class': 'text-none'
+                                                            'class': 'text-body-2'
                                                         },
-                                                        'text': '清理硬链接映射',
-                                                        'events': {
-                                                            'click': {
-                                                                'api': 'plugin/IYUUAutoSeed/linkmap/clean',
-                                                                'method': 'post'
-                                                            }
-                                                        }
+                                                        'text': '当前映射清单在插件详情页（配置页下方）常驻显示；'
+                                                                '也可以直接调 API：GET /api/v1/plugin/IYUUAutoSeed/linkmap'
                                                     }
                                                 ]
                                             }
@@ -871,6 +869,7 @@ class IYUUAutoSeed(_PluginBase):
             "hardlink": False,
             "linkroot": "_reseed",
             "linkblock": "Music",
+            "linkclean": False,
             "cron": "",
             "token": "",
             "downloaders": [],
@@ -884,7 +883,70 @@ class IYUUAutoSeed(_PluginBase):
         }
 
     def get_page(self) -> List[dict]:
-        pass
+        """
+        【v2.27】插件详情页：直接列出当前硬链接映射清单。
+        （原「查看清单」按钮在本版前端不触发 events.click，改成详情页常驻展示）
+        """
+        records = self.__linkmap_records()
+        headers = [
+            {"component": "th", "text": "专辑/种子名"},
+            {"component": "th", "text": "映射目录"},
+            {"component": "th", "text": "源目录"},
+            {"component": "th", "text": "建立时间"},
+            {"component": "th", "text": "存在"},
+        ]
+        rows = []
+        for name, item in records.items():
+            item = item or {}
+            target = item.get("dir") or ""
+            rows.append({
+                "component": "tr",
+                "content": [
+                    {"component": "td", "text": name},
+                    {"component": "td", "text": target},
+                    {"component": "td", "text": item.get("src") or ""},
+                    {"component": "td", "text": item.get("ts") or ""},
+                    {"component": "td", "text": "是" if target and os.path.isdir(target) else "否"},
+                ],
+            })
+        if not rows:
+            rows = [{
+                "component": "tr",
+                "content": [{
+                    "component": "td",
+                    "props": {"colspan": 5},
+                    "text": "暂无映射记录（未开启「目录名不一致时硬链接映射」，或尚未建立过映射）",
+                }],
+            }]
+        return [{
+            "component": "VRow",
+            "content": [{
+                "component": "VCol",
+                "props": {"cols": 12},
+                "content": [{
+                    "component": "VCard",
+                    "props": {"variant": "outlined", "class": "mt-3"},
+                    "content": [
+                        {"component": "VCardTitle", "props": {"class": "text-h6"},
+                         "text": f"硬链接映射清单（{len(records)} 条）"},
+                        {"component": "VCardText", "content": [
+                            {"component": "VAlert",
+                             "props": {"type": "info", "variant": "tonal", "class": "mb-3"},
+                             "text": "映射目录固定在各卷 _reseed 下（默认 /videoN/video/_reseed），"
+                                     "Navidrome（只扫 Music）和 Emby（只扫 link）都不会看到。"
+                                     "清理请用配置页「保存时清理硬链接映射」开关。"},
+                            {"component": "VTable",
+                             "props": {"hover": True, "density": "compact"},
+                             "content": [
+                                 {"component": "thead",
+                                  "content": [{"component": "tr", "content": headers}]},
+                                 {"component": "tbody", "content": rows},
+                             ]},
+                        ]},
+                    ],
+                }],
+            }],
+        }]
 
     def __update_config(self):
         self.update_config({
@@ -910,6 +972,7 @@ class IYUUAutoSeed(_PluginBase):
             "hardlink": self._hardlink,
             "linkroot": self._linkroot,
             "linkblock": self._linkblock,
+            "linkclean": self._linkclean,
             "size": self._size,
             "success_caches": self._success_caches,
             "error_caches": self._error_caches,
