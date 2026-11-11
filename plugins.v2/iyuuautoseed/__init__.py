@@ -35,7 +35,7 @@ class IYUUAutoSeed(_PluginBase):
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "2.24"
+    plugin_version = "2.25"
     # 插件作者
     plugin_author = "jxxghp,CKun"
     # 作者主页
@@ -89,6 +89,12 @@ class IYUUAutoSeed(_PluginBase):
     _gazelle_keys = {}
     # 【补丁】命中率 100% 时是否额外做 MD5 校验（慢，默认关）
     _md5check = False
+    # 【v2.25】目录名不一致时是否做硬链接映射（默认关，避免污染媒体库）
+    _hardlink = False
+    # 【v2.25】映射根目录（相对 /videoN/video，默认 _reseed；禁止填媒体库目录）
+    _linkroot = "_reseed"
+    # 【v2.25】媒体库黑名单（逗号分隔），映射目录命中则不映射
+    _linkblock = "Music"
     # 辅种缓存，出错的种子不再重复辅种，可清除
     _error_caches = []
     # 辅种缓存，辅种成功的种子，可清除
@@ -129,6 +135,9 @@ class IYUUAutoSeed(_PluginBase):
             self._auto_start = config.get("auto_start")
             self._reuse_save_path = config.get("reuse_save_path", True)
             self._md5check = bool(config.get("md5check"))
+            self._hardlink = bool(config.get("hardlink"))
+            self._linkroot = config.get("linkroot") or "_reseed"
+            self._linkblock = config.get("linkblock") or "Music"
             self._addhosttotag = config.get("addhosttotag")
             self._size = float(config.get("size")) if config.get("size") else 0
             self._clearcache = config.get("clearcache")
@@ -236,7 +245,25 @@ class IYUUAutoSeed(_PluginBase):
         pass
 
     def get_api(self) -> List[Dict[str, Any]]:
-        pass
+        """
+        【v2.25】硬链接映射相关的两个按钮接口
+        """
+        return [
+            {
+                "path": "/linkmap",
+                "endpoint": self.get_linkmap,
+                "methods": ["GET"],
+                "summary": "查看硬链接映射清单",
+                "description": "列出辅种时为解决目录名不一致而建立的硬链接映射"
+            },
+            {
+                "path": "/linkmap/clean",
+                "endpoint": self.clean_linkmap,
+                "methods": ["POST"],
+                "summary": "清理硬链接映射",
+                "description": "删除插件自己建立的硬链接映射目录（仅限映射根下，逐文件删除）"
+            }
+        ]
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -639,6 +666,117 @@ class IYUUAutoSeed(_PluginBase):
                                         }
                                     }
                                 ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'hardlink',
+                                            'label': '目录名不一致时硬链接映射',
+                                            'messages': '同一专辑各站命名不同时，在「映射根目录」下建硬链接再辅种；不占空间，不会污染媒体库'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'linkroot',
+                                            'label': '硬链接映射根目录',
+                                            'placeholder': '_reseed（相对 /videoN/video）'
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VTextField',
+                                        'props': {
+                                            'model': 'linkblock',
+                                            'label': '媒体库黑名单(逗号分隔)',
+                                            'placeholder': 'Music（命中则不做映射）'
+                                        }
+                                    }
+                                ]
+                            }
+                        ]
+                    },
+                    {
+                        'component': 'VRow',
+                        'props': {
+                            'style': {
+                                'margin-top': '12px'
+                            },
+                        },
+                        'content': [
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VBtn',
+                                        'props': {
+                                            'color': 'primary',
+                                            'variant': 'tonal',
+                                            'prependIcon': 'mdi-link-variant',
+                                            'class': 'text-none'
+                                        },
+                                        'text': '查看硬链接映射清单',
+                                        'events': {
+                                            'click': {
+                                                'api': 'plugin/IYUUAutoSeed/linkmap',
+                                                'method': 'get'
+                                            }
+                                        }
+                                    }
+                                ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VBtn',
+                                        'props': {
+                                            'color': 'error',
+                                            'variant': 'tonal',
+                                            'prependIcon': 'mdi-link-variant-off',
+                                            'class': 'text-none'
+                                        },
+                                        'text': '清理硬链接映射',
+                                        'events': {
+                                            'click': {
+                                                'api': 'plugin/IYUUAutoSeed/linkmap/clean',
+                                                'method': 'post'
+                                            }
+                                        }
+                                    }
+                                ]
                             }
                         ]
                     },
@@ -699,6 +837,9 @@ class IYUUAutoSeed(_PluginBase):
             "auto_start": False,
             "reuse_save_path": True,
             "md5check": False,
+            "hardlink": False,
+            "linkroot": "_reseed",
+            "linkblock": "Music",
             "cron": "",
             "token": "",
             "downloaders": [],
@@ -735,6 +876,9 @@ class IYUUAutoSeed(_PluginBase):
             "auto_start": self._auto_start,
             "reuse_save_path": self._reuse_save_path,
             "md5check": self._md5check,
+            "hardlink": self._hardlink,
+            "linkroot": self._linkroot,
+            "linkblock": self._linkblock,
             "size": self._size,
             "success_caches": self._success_caches,
             "error_caches": self._error_caches,
@@ -1532,6 +1676,38 @@ class IYUUAutoSeed(_PluginBase):
         except OSError:
             return False
 
+    def __map_root(self, save_path: str) -> Optional[str]:
+        """
+        【v2.25】计算硬链接映射根目录。
+
+        默认 `_reseed`，相对**卷根**（如 save_path=/video2/video/Music/某歌手 →
+        /video2/video/_reseed）。必须与源文件同一卷（硬链接不能跨卷），
+        且**绝不能落在媒体库扫描目录下**（Navidrome 只扫 /video2/video/Music，
+        Emby 只扫各卷 link/），否则会在音乐库/影视库里多出一份重复专辑。
+        """
+        if not self._hardlink:
+            return None
+        matched = re.match(r"^(/video\d+/video)/", save_path or "")
+        if not matched:
+            return None
+        volume_root = matched.group(1)
+        sub = (self._linkroot or "_reseed").strip().strip("/")
+        if not sub:
+            return None
+        map_root = os.path.join(volume_root, sub)
+        # 安全栅栏：映射目录不得落在源保存目录之内，也不得命中媒体库黑名单
+        norm_map = os.path.normpath(map_root) + os.sep
+        norm_save = os.path.normpath(save_path) + os.sep
+        if norm_map.startswith(norm_save) or norm_save.startswith(norm_map):
+            logger.warning(f"映射目录 {map_root} 与保存目录 {save_path} 重叠，跳过硬链接映射")
+            return None
+        # 注意：这里必须先把整串当一个整体再按逗号切，直接 for 字符串会按字符迭代（曾踩坑）
+        for part in [x.strip() for x in (self._linkblock or "Music").split(",") if x.strip()]:
+            if f"/{part}/" in norm_map or norm_map.rstrip("/").endswith(f"/{part}"):
+                logger.warning(f"映射目录 {map_root} 命中媒体库黑名单 [{part}]，跳过硬链接映射")
+                return None
+        return map_root
+
     def __map_by_content(self, save_path: str, name: str, files: list) -> Optional[Tuple[str, float]]:
         """
         【v2.24】同一张专辑在不同站的目录命名规范不同（如 open.cd 用
@@ -1558,10 +1734,14 @@ class IYUUAutoSeed(_PluginBase):
                     continue
                 if not all(self.__size_eq(os.path.join(base, rel), size) for rel, size in files):
                     continue
-                target_dir = os.path.join(save_path, name)
+                target_dir = os.path.join(self.__map_root(save_path) or "", name)
+                if not target_dir or not self.__map_root(save_path):
+                    logger.warn("未启用硬链接映射或映射目录不安全，放弃辅种")
+                    return None
                 logger.info(f"目录名不一致，按内容命中：{base}")
                 if self.__link_tree(base, target_dir, files):
-                    return save_path, 1.0
+                    self.__record_linkmap(name, target_dir, base)
+                    return os.path.dirname(target_dir), 1.0
                 return None
         return None
 
@@ -1593,6 +1773,84 @@ class IYUUAutoSeed(_PluginBase):
                 return False
         logger.info(f"已建立硬链接映射：{src_dir} -> {dst_dir}（{len(files)} 个文件，不占额外空间）")
         return True
+
+    def __record_linkmap(self, name: str, target_dir: str, src_dir: str) -> None:
+        """【v2.25】记录已建立的硬链接映射，供「查看映射清单 / 清理映射」按钮使用。"""
+        try:
+            records = self.get_data(key="linkmap") or {}
+            if not isinstance(records, dict):
+                records = {}
+            records[name] = {"dir": target_dir, "src": src_dir,
+                             "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+            self.save_data(key="linkmap", value=records)
+        except Exception as err:
+            logger.debug(f"记录硬链接映射失败：{err}")
+
+    def __linkmap_records(self) -> dict:
+        try:
+            records = self.get_data(key="linkmap") or {}
+            return records if isinstance(records, dict) else {}
+        except Exception:
+            return {}
+
+    def get_linkmap(self) -> List[Dict[str, Any]]:
+        """【v2.25】API：列出当前硬链接映射（UI 按钮「查看映射清单」）"""
+        result = []
+        for name, item in self.__linkmap_records().items():
+            target_dir = (item or {}).get("dir") or ""
+            exists = bool(target_dir) and os.path.isdir(target_dir)
+            result.append({"name": name, "dir": target_dir,
+                           "src": (item or {}).get("src") or "",
+                           "ts": (item or {}).get("ts") or "",
+                           "exists": exists})
+        logger.info(f"硬链接映射共 {len(result)} 条")
+        return result
+
+    def clean_linkmap(self) -> Dict[str, Any]:
+        """
+        【v2.25】API：清理已建立的硬链接映射（UI 按钮「清理映射」）。
+
+        安全约束：只删插件自己记录过的目录，且必须位于配置的映射根（默认 `_reseed`）下；
+        逐文件 unlink + rmdir，**不做任何递归删除**。
+        """
+        records = self.__linkmap_records()
+        removed, kept = [], []
+        for name, item in records.items():
+            target_dir = os.path.normpath((item or {}).get("dir") or "")
+            if not target_dir or not os.path.isdir(target_dir):
+                kept.append(f"{name}（目录不存在，跳过）")
+                continue
+            matched = re.match(r"^(/video\d+/video)/", target_dir)
+            sub = (self._linkroot or "_reseed").strip().strip("/")
+            if not matched or f"{matched.group(1)}/{sub}/" not in target_dir + "/":
+                kept.append(f"{name}（不在映射根下，拒绝删除）")
+                continue
+            files_removed = 0
+            try:
+                for root, dirs, filenames in os.walk(target_dir, topdown=False):
+                    for filename in filenames:
+                        path = os.path.join(root, filename)
+                        try:
+                            os.unlink(path)
+                            files_removed += 1
+                        except OSError as err:
+                            logger.warn(f"删除失败：{path} {err}")
+                    for dirname in dirs:
+                        try:
+                            os.rmdir(os.path.join(root, dirname))
+                        except OSError:
+                            pass
+                os.rmdir(target_dir)
+                records.pop(name, None)
+                removed.append(f"{name}（{files_removed} 个文件）")
+                logger.info(f"已清理硬链接映射：{target_dir}")
+            except OSError as err:
+                kept.append(f"{name}（{err}）")
+        try:
+            self.save_data(key="linkmap", value=records)
+        except Exception:
+            pass
+        return {"removed": removed, "kept": kept}
 
     @staticmethod
     def __md5_verify(base: str, name: str, files: list, single: bool) -> None:
