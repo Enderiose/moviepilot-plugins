@@ -35,7 +35,7 @@ class IYUUAutoSeed(_PluginBase):
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "2.25"
+    plugin_version = "2.26"
     # 插件作者
     plugin_author = "jxxghp,CKun"
     # 作者主页
@@ -667,114 +667,145 @@ class IYUUAutoSeed(_PluginBase):
                                     }
                                 ]
                             },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VSwitch',
-                                        'props': {
-                                            'model': 'hardlink',
-                                            'label': '目录名不一致时硬链接映射',
-                                            'messages': '同一专辑各站命名不同时，在「映射根目录」下建硬链接再辅种；不占空间，不会污染媒体库'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'linkroot',
-                                            'label': '硬链接映射根目录',
-                                            'placeholder': '_reseed（相对 /videoN/video）'
-                                        }
-                                    }
-                                ]
-                            },
-                            {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
-                                'content': [
-                                    {
-                                        'component': 'VTextField',
-                                        'props': {
-                                            'model': 'linkblock',
-                                            'label': '媒体库黑名单(逗号分隔)',
-                                            'placeholder': 'Music（命中则不做映射）'
-                                        }
-                                    }
-                                ]
-                            }
                         ]
                     },
                     {
-                        'component': 'VRow',
+                        'component': 'VCard',
                         'props': {
-                            'style': {
-                                'margin-top': '12px'
-                            },
+                            'variant': 'outlined',
+                            'class': 'mt-3',
                         },
                         'content': [
                             {
-                                'component': 'VCol',
+                                'component': 'VCardTitle',
                                 'props': {
-                                    'cols': 12,
-                                    'md': 3
+                                    'class': 'text-h6',
                                 },
-                                'content': [
-                                    {
-                                        'component': 'VBtn',
-                                        'props': {
-                                            'color': 'primary',
-                                            'variant': 'tonal',
-                                            'prependIcon': 'mdi-link-variant',
-                                            'class': 'text-none'
-                                        },
-                                        'text': '查看硬链接映射清单',
-                                        'events': {
-                                            'click': {
-                                                'api': 'plugin/IYUUAutoSeed/linkmap',
-                                                'method': 'get'
-                                            }
-                                        }
-                                    }
-                                ]
+                                'text': '海豚音乐（DicMusic）专区'
                             },
                             {
-                                'component': 'VCol',
-                                'props': {
-                                    'cols': 12,
-                                    'md': 3
-                                },
+                                'component': 'VCardText',
                                 'content': [
                                     {
-                                        'component': 'VBtn',
+                                        'component': 'VAlert',
                                         'props': {
-                                            'color': 'error',
+                                            'type': 'info',
                                             'variant': 'tonal',
-                                            'prependIcon': 'mdi-link-variant-off',
-                                            'class': 'text-none'
+                                            'class': 'mb-3',
                                         },
-                                        'text': '清理硬链接映射',
-                                        'events': {
-                                            'click': {
-                                                'api': 'plugin/IYUUAutoSeed/linkmap/clean',
-                                                'method': 'post'
+                                        'text': '海豚（dicmusic.com / 52dic.vip）是 Gazelle 架构，下载链接需要 authkey + torrent_pass；'
+                                                '同一张专辑各站命名规范不同，开启硬链接映射后会在「映射根目录」下建硬链接再辅种（不占空间）。'
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VSwitch',
+                                                        'props': {
+                                                            'model': 'hardlink',
+                                                            'label': '目录名不一致时硬链接映射',
+                                                            'messages': '默认关。开启后不占额外空间，映射目录不在媒体库扫描范围内'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'linkroot',
+                                                            'label': '硬链接映射根目录',
+                                                            'placeholder': '_reseed（相对 /videoN/video）'
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VTextField',
+                                                        'props': {
+                                                            'model': 'linkblock',
+                                                            'label': '媒体库黑名单(逗号分隔)',
+                                                            'placeholder': 'Music（命中则不做映射）'
+                                                        }
+                                                    }
+                                                ]
                                             }
-                                        }
+                                        ]
+                                    },
+                                    {
+                                        'component': 'VRow',
+                                        'content': [
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VBtn',
+                                                        'props': {
+                                                            'color': 'primary',
+                                                            'variant': 'tonal',
+                                                            'prependIcon': 'mdi-link-variant',
+                                                            'class': 'text-none'
+                                                        },
+                                                        'text': '查看硬链接映射清单',
+                                                        'events': {
+                                                            'click': {
+                                                                'api': 'plugin/IYUUAutoSeed/linkmap',
+                                                                'method': 'get'
+                                                            }
+                                                        }
+                                                    }
+                                                ]
+                                            },
+                                            {
+                                                'component': 'VCol',
+                                                'props': {
+                                                    'cols': 12,
+                                                    'md': 4
+                                                },
+                                                'content': [
+                                                    {
+                                                        'component': 'VBtn',
+                                                        'props': {
+                                                            'color': 'error',
+                                                            'variant': 'tonal',
+                                                            'prependIcon': 'mdi-link-variant-off',
+                                                            'class': 'text-none'
+                                                        },
+                                                        'text': '清理硬链接映射',
+                                                        'events': {
+                                                            'click': {
+                                                                'api': 'plugin/IYUUAutoSeed/linkmap/clean',
+                                                                'method': 'post'
+                                                            }
+                                                        }
+                                                    }
+                                                ]
+                                            }
+                                        ]
                                     }
                                 ]
                             }
