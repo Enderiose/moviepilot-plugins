@@ -35,7 +35,7 @@ class IYUUAutoSeed(_PluginBase):
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "2.27"
+    plugin_version = "2.28"
     # 插件作者
     plugin_author = "jxxghp,CKun"
     # 作者主页
@@ -1880,12 +1880,55 @@ class IYUUAutoSeed(_PluginBase):
         except Exception as err:
             logger.debug(f"记录硬链接映射失败：{err}")
 
+    def __scan_linkmap(self) -> dict:
+        """
+        【v2.28】扫描各卷 <linkroot> 下**真实存在**的映射目录。
+        不依赖插件记录 —— 手工建的、重启后丢记录的也能显示出来。
+        """
+        found = {}
+        sub = (self._linkroot or "_reseed").strip().strip("/")
+        if not sub:
+            return found
+        for idx in range(1, 10):
+            root = f"/video{idx}/video/{sub}"
+            if not os.path.isdir(root):
+                continue
+            for dirpath, _dirnames, filenames in os.walk(root):
+                if not filenames:
+                    continue
+                if dirpath[len(root):].count(os.sep) > 3:
+                    continue
+                try:
+                    mtime = datetime.fromtimestamp(os.path.getmtime(dirpath)).strftime("%Y-%m-%d %H:%M:%S")
+                except OSError:
+                    mtime = ""
+                found[os.path.basename(dirpath)] = {
+                    "dir": dirpath,
+                    "src": "",
+                    "ts": mtime,
+                    "scanned": True,
+                }
+        return found
+
     def __linkmap_records(self) -> dict:
+        """
+        【v2.28】合并「扫描到的真实目录」与「插件记录」：记录里的 src/ts 更详细，优先保留。
+        """
         try:
-            records = self.get_data(key="linkmap") or {}
-            return records if isinstance(records, dict) else {}
+            stored = self.get_data(key="linkmap") or {}
         except Exception:
-            return {}
+            stored = {}
+        if not isinstance(stored, dict):
+            stored = {}
+        merged = self.__scan_linkmap()
+        for name, item in stored.items():
+            if not isinstance(item, dict):
+                continue
+            target = item.get("dir") or ""
+            if target and not os.path.isdir(target):
+                continue
+            merged[name] = {**merged.get(name, {}), **item}
+        return merged
 
     def get_linkmap(self) -> List[Dict[str, Any]]:
         """【v2.25】API：列出当前硬链接映射（UI 按钮「查看映射清单」）"""
