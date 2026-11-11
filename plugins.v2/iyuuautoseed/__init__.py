@@ -35,7 +35,7 @@ class IYUUAutoSeed(_PluginBase):
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "2.23"
+    plugin_version = "2.24"
     # 插件作者
     plugin_author = "jxxghp,CKun"
     # 作者主页
@@ -1510,6 +1510,11 @@ class IYUUAutoSeed(_PluginBase):
                         break
                 if best_ratio >= 1:
                     break
+        # 【v2.24】仍不足：按内容搜索（忽略顶层目录名），必要时用硬链接映射到种子要求的目录名
+        if best_ratio < 1 and not candidate["single"]:
+            mapped = self.__map_by_content(save_path, name, files)
+            if mapped:
+                best_base, best_ratio = mapped
         detail = (f"候选【{name}】分块 {candidate['piece_length']} 文件 {len(files)} 个，"
                   f"路径命中率 {best_ratio:.0%}，基准目录 {best_base}")
         if best_ratio >= 1:
@@ -1519,6 +1524,75 @@ class IYUUAutoSeed(_PluginBase):
         else:
             logger.warn(f"{detail}（文件可能缺失或命名不同，辅种后请检查校验结果）")
         return best_base
+
+    @staticmethod
+    def __size_eq(path: str, size: int) -> bool:
+        try:
+            return os.path.getsize(path) == size
+        except OSError:
+            return False
+
+    def __map_by_content(self, save_path: str, name: str, files: list) -> Optional[Tuple[str, float]]:
+        """
+        【v2.24】同一张专辑在不同站的目录命名规范不同（如 open.cd 用
+        「[2023.05.08] TVアニメ…斜陽…」、海豚用「ヨルシカ - 斜陽 (2023) {Polydor…}」），
+        文件内容和大小完全一致，但 <download_dir>/<种子名>/ 找不到。
+
+        这里按「相对路径 + 大小」忽略顶层目录名找到真实目录，再用**硬链接**把文件映射到
+        <save_path>/<种子名>/（同分区不占额外空间，删源不影响），使校验能 100% 通过。
+        返回 (基准目录, 命中率) 或 None。
+        """
+        if not files or len(files) > 200:
+            return None
+        parents = [save_path, os.path.dirname(os.path.normpath(save_path))]
+        for parent in parents:
+            try:
+                children = sorted(os.listdir(parent))[:500]
+            except OSError:
+                continue
+            for child in children:
+                if child == name:
+                    continue
+                base = os.path.join(parent, child)
+                if not os.path.isdir(base):
+                    continue
+                if not all(self.__size_eq(os.path.join(base, rel), size) for rel, size in files):
+                    continue
+                target_dir = os.path.join(save_path, name)
+                logger.info(f"目录名不一致，按内容命中：{base}")
+                if self.__link_tree(base, target_dir, files):
+                    return save_path, 1.0
+                return None
+        return None
+
+    def __link_tree(self, src_dir: str, dst_dir: str, files: list) -> bool:
+        """
+        【v2.24】把 src_dir 下的文件硬链接到 dst_dir（跨分区退化为软链接），不复制数据。
+        """
+        try:
+            os.makedirs(dst_dir, exist_ok=True)
+        except OSError as err:
+            logger.warn(f"创建目录失败：{dst_dir} {err}")
+            return False
+        for rel, size in files:
+            src = os.path.join(src_dir, rel)
+            dst = os.path.join(dst_dir, rel)
+            if os.path.exists(dst):
+                continue
+            try:
+                parent = os.path.dirname(dst)
+                if parent and parent != dst_dir:
+                    os.makedirs(parent, exist_ok=True)
+                try:
+                    os.link(src, dst)
+                except OSError:
+                    os.symlink(src, dst)
+                    logger.warn(f"跨分区，已用软链接代替硬链接：{dst}")
+            except OSError as err:
+                logger.warn(f"映射失败：{src} -> {dst} {err}")
+                return False
+        logger.info(f"已建立硬链接映射：{src_dir} -> {dst_dir}（{len(files)} 个文件，不占额外空间）")
+        return True
 
     @staticmethod
     def __md5_verify(base: str, name: str, files: list, single: bool) -> None:
