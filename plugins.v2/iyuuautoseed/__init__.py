@@ -1,5 +1,6 @@
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from threading import Event
 from typing import Any, Dict, List, Optional, Tuple
@@ -30,11 +31,11 @@ class IYUUAutoSeed(_PluginBase):
     # 插件名称
     plugin_name = "IYUU自动辅种"
     # 插件描述
-    plugin_desc = "基于IYUU官方Api实现自动辅种。"
+    plugin_desc = "基于IYUU官方Api实现自动辅种。（本地补丁 2.23：支持 Gazelle 架构站点 authkey/torrent_pass + 架构自适应保存路径 + 可选 MD5 校验）"
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "2.22"
+    plugin_version = "2.23"
     # 插件作者
     plugin_author = "jxxghp,CKun"
     # 作者主页
@@ -84,6 +85,10 @@ class IYUUAutoSeed(_PluginBase):
     _is_recheck_running = False
     # 已自动补发校验的种子hash，避免重复补发
     _auto_rechecked = set()
+    # 【补丁】Gazelle 架构站点（海豚/52dic 等）的 authkey / torrent_pass 缓存
+    _gazelle_keys = {}
+    # 【补丁】命中率 100% 时是否额外做 MD5 校验（慢，默认关）
+    _md5check = False
     # 辅种缓存，出错的种子不再重复辅种，可清除
     _error_caches = []
     # 辅种缓存，辅种成功的种子，可清除
@@ -123,6 +128,7 @@ class IYUUAutoSeed(_PluginBase):
             self._auto_category = config.get("auto_category")
             self._auto_start = config.get("auto_start")
             self._reuse_save_path = config.get("reuse_save_path", True)
+            self._md5check = bool(config.get("md5check"))
             self._addhosttotag = config.get("addhosttotag")
             self._size = float(config.get("size")) if config.get("size") else 0
             self._clearcache = config.get("clearcache")
@@ -146,6 +152,9 @@ class IYUUAutoSeed(_PluginBase):
         # 重新初始化运行期校验队列，避免类级字典跨插件重载残留。
         self._recheck_torrents = {}
         self._auto_rechecked = set()
+        # 【补丁】Gazelle 凭据缓存每次加载重置
+        self._gazelle_keys = {}
+        self._md5check = bool(config.get("md5check")) if config else False
 
         # 启动定时任务 & 立即运行一次
         if self.get_state() or self._onlyonce:
@@ -614,6 +623,22 @@ class IYUUAutoSeed(_PluginBase):
                                         }
                                     }
                                 ]
+                            },
+                            {
+                                'component': 'VCol',
+                                'props': {
+                                    'cols': 12,
+                                    'md': 3
+                                },
+                                'content': [
+                                    {
+                                        'component': 'VSwitch',
+                                        'props': {
+                                            'model': 'md5check',
+                                            'label': 'MD5校验(命中后算文件MD5，慢)',
+                                        }
+                                    }
+                                ]
                             }
                         ]
                     },
@@ -673,6 +698,7 @@ class IYUUAutoSeed(_PluginBase):
             "auto_category": False,
             "auto_start": False,
             "reuse_save_path": True,
+            "md5check": False,
             "cron": "",
             "token": "",
             "downloaders": [],
@@ -708,6 +734,7 @@ class IYUUAutoSeed(_PluginBase):
             "auto_category": self._auto_category,
             "auto_start": self._auto_start,
             "reuse_save_path": self._reuse_save_path,
+            "md5check": self._md5check,
             "size": self._size,
             "success_caches": self._success_caches,
             "error_caches": self._error_caches,
@@ -1187,17 +1214,25 @@ class IYUUAutoSeed(_PluginBase):
             cookie=site_info.get("cookie"),
             ua=site_info.get("ua") or settings.USER_AGENT,
             proxy=site_info.get("proxy"))
-        if not content:
+        # 【补丁】站点流控/404 页面常以 200 返回 HTML，这里挡掉非 bencode 内容，避免加进无效种子
+        content_bytes = content.encode() if isinstance(content, str) else content
+        if not content_bytes or content_bytes.lstrip()[:1] != b"d":
             # 下载失败
             self.fail += 1
             # 加入失败缓存
             if error_msg and ('无法打开链接' in error_msg or '触发站点流控' in error_msg):
                 self.__append_seed_cache(self._error_caches, seed.get("info_hash"))
             else:
-                # 种子不存在的情况
+                # 种子不存在的情况（含被流控返回 HTML 的情况）
                 self.__append_seed_cache(self._permanent_error_caches, seed.get("info_hash"))
-            logger.error(f"下载种子文件失败：{torrent_url}")
+            logger.error(f"下载种子文件失败（内容非种子）：{torrent_url}")
             return False
+        content = content_bytes
+        # 【补丁】架构自适应：按候选种子的真实目录层级重新定位基准目录，避免 0% 校验
+        try:
+            save_path = self.__resolve_save_path(content, save_path)
+        except Exception as err:
+            logger.warn(f"架构自适应解析失败，沿用原保存路径：{err}")
         # 添加下载，辅种任务默认暂停
         logger.info(f"添加下载任务：{torrent_url} ...")
         download_id = self.__download(service=service,
@@ -1307,6 +1342,207 @@ class IYUUAutoSeed(_PluginBase):
         except Exception as e:
             print(str(e))
             return ""
+
+    def __get_gazelle_keys(self, site: dict) -> Tuple[str, str]:
+        """
+        【补丁】获取 Gazelle 架构站点（海豚/52dic、redacted 等）的 authkey / torrent_pass。
+
+        Gazelle 站点的下载链接形如：
+            torrents.php?action=download&id={}&authkey={authkey}&torrent_pass={torrent_pass}
+        authkey / torrent_pass 是用户私有凭据，站点配置里并不存在，
+        需要带站点 Cookie 抓一次列表页/个人页解析出来（进程内缓存，一次运行只抓一次）。
+        """
+        site_url = (site.get("url") or "").rstrip("/")
+        if not site_url:
+            return "", ""
+        domain = StringUtils.get_url_domain(site_url) or site_url
+        cached = self._gazelle_keys.get(domain)
+        if cached:
+            return cached
+        # 先读插件数据持久缓存（站点流控时不必重新抓）
+        try:
+            stored = self.get_data(key=f"gazelle_{domain}")
+            if isinstance(stored, (list, tuple)) and len(stored) == 2 and stored[0]:
+                self._gazelle_keys[domain] = (stored[0], stored[1] or "")
+                return self._gazelle_keys[domain]
+        except Exception:
+            pass
+        authkey, torrent_pass = "", ""
+        for path in ("/torrents.php", "/user.php", "/index.php"):
+            if authkey and torrent_pass:
+                break
+            for attempt in range(2):
+                try:
+                    ret = RequestUtils(cookies=site.get("cookie"), ua=site.get("ua")).get_res(
+                        f"{site_url}{path}", timeout=20)
+                except Exception as err:
+                    logger.debug(f"获取 {domain} 的 authkey 失败：{err}")
+                    ret = None
+                if not ret or not ret.text:
+                    time.sleep(3)
+                    continue
+                if not authkey:
+                    matched = re.search(r"authkey=([0-9a-fA-F]{16,64})", ret.text)
+                    authkey = matched.group(1) if matched else ""
+                if not torrent_pass:
+                    matched = re.search(r"torrent_pass=([0-9a-fA-F]{16,64})", ret.text)
+                    torrent_pass = matched.group(1) if matched else ""
+                break
+        if not torrent_pass:
+            # Gazelle 的 torrent_pass 一般与站点 passkey 相同
+            torrent_pass = site.get("passkey") or ""
+        if authkey and torrent_pass:
+            logger.info(f"已解析 Gazelle 站点 {domain} 的下载凭据（authkey/torrent_pass）")
+            try:
+                self.save_data(key=f"gazelle_{domain}", value=[authkey, torrent_pass])
+            except Exception:
+                pass
+        else:
+            logger.warn(f"未能解析 {domain} 的 authkey/torrent_pass，该站点无法辅种")
+        self._gazelle_keys[domain] = (authkey, torrent_pass)
+        return authkey, torrent_pass
+
+    @staticmethod
+    def __bdecode(data: bytes) -> Any:
+        """【补丁】极简 bencode 解码，用于读取候选种子的文件清单 / 分块长度。"""
+
+        def _dec(idx: int):
+            char = data[idx:idx + 1]
+            if char == b"d":
+                idx += 1
+                result = {}
+                while data[idx:idx + 1] != b"e":
+                    key, idx = _dec(idx)
+                    val, idx = _dec(idx)
+                    result[key] = val
+                return result, idx + 1
+            if char == b"l":
+                idx += 1
+                result = []
+                while data[idx:idx + 1] != b"e":
+                    val, idx = _dec(idx)
+                    result.append(val)
+                return result, idx + 1
+            if char == b"i":
+                end = data.index(b"e", idx)
+                return int(data[idx + 1:end]), end + 1
+            end = data.index(b":", idx)
+            length = int(data[idx:end])
+            return data[end + 1:end + 1 + length], end + 1 + length
+
+        return _dec(0)[0]
+
+    def __parse_candidate(self, content: bytes) -> Optional[dict]:
+        """
+        【补丁】解析候选种子：根目录名、分块长度、[(相对路径, 大小)]
+        """
+        try:
+            meta = self.__bdecode(content).get(b"info") or {}
+        except Exception as err:
+            logger.debug(f"候选种子解析失败：{err}")
+            return None
+        raw_name = meta.get(b"name")
+        if not raw_name:
+            return None
+        name = raw_name.decode("utf-8", "replace")
+        files = meta.get(b"files")
+        entries = []
+        if files:
+            for item in files:
+                rel = "/".join(x.decode("utf-8", "replace") for x in (item.get(b"path") or []))
+                entries.append((rel, int(item.get(b"length") or 0)))
+        else:
+            entries.append(("", int(meta.get(b"length") or 0)))
+        return {"name": name,
+                "piece_length": int(meta.get(b"piece length") or 0),
+                "files": entries,
+                "single": not files}
+
+    def __resolve_save_path(self, content: bytes, save_path: str) -> str:
+        """
+        【补丁】架构自适应：候选种子的目录层级可能和源种子不同
+        （52dic 带专辑目录 / Gazelle 平铺，或反过来），直接沿用源种子 save_path 会 0% 校验。
+        这里在磁盘上按「文件名 + 大小」重新定位基准目录，命中率最高者胜出。
+        """
+        if not save_path:
+            return save_path
+        candidate = self.__parse_candidate(content)
+        if not candidate:
+            return save_path
+        name, files = candidate["name"], candidate["files"]
+        if not files:
+            return save_path
+
+        def hit_ratio(base: str) -> float:
+            hit = 0
+            for rel, size in files:
+                path = os.path.join(base, name) if candidate["single"] else os.path.join(base, name, rel)
+                try:
+                    if os.path.getsize(path) == size:
+                        hit += 1
+                except OSError:
+                    continue
+            return hit / len(files)
+
+        bases = [save_path,
+                 os.path.dirname(os.path.normpath(save_path)),
+                 os.path.join(save_path, name)]
+        best_base, best_ratio = save_path, hit_ratio(save_path)
+        for base in bases[1:]:
+            ratio = hit_ratio(base)
+            if ratio > best_ratio:
+                best_base, best_ratio = base, ratio
+        # 命中不足时，在 save_path 及其父目录下一层范围内找正确基准目录（限制数量，避免扫盘）
+        if best_ratio < 1:
+            for parent in {save_path, os.path.dirname(os.path.normpath(save_path))}:
+                try:
+                    children = sorted(os.listdir(parent))[:500]
+                except OSError:
+                    continue
+                for child in children:
+                    base = os.path.join(parent, child)
+                    if not os.path.isdir(base):
+                        continue
+                    ratio = hit_ratio(base)
+                    if ratio > best_ratio:
+                        best_base, best_ratio = base, ratio
+                    if best_ratio >= 1:
+                        break
+                if best_ratio >= 1:
+                    break
+        detail = (f"候选【{name}】分块 {candidate['piece_length']} 文件 {len(files)} 个，"
+                  f"路径命中率 {best_ratio:.0%}，基准目录 {best_base}")
+        if best_ratio >= 1:
+            logger.info(detail)
+            if self._md5check:
+                self.__md5_verify(best_base, name, files, candidate["single"])
+        else:
+            logger.warn(f"{detail}（文件可能缺失或命名不同，辅种后请检查校验结果）")
+        return best_base
+
+    @staticmethod
+    def __md5_verify(base: str, name: str, files: list, single: bool) -> None:
+        """
+        【补丁】MD5 校验：把命中文件逐个算 MD5，汇总成「专辑指纹」写日志，
+        便于跨站比对同一份文件（分块长度不同不影响文件 MD5）。
+        """
+        import hashlib
+
+        digests = []
+        for rel, size in files:
+            path = os.path.join(base, name) if single else os.path.join(base, name, rel)
+            try:
+                md5 = hashlib.md5()
+                with open(path, "rb") as fh:
+                    for chunk in iter(lambda: fh.read(4 * 1024 * 1024), b""):
+                        md5.update(chunk)
+                digests.append(f"{md5.hexdigest()}  {rel or name}")
+            except OSError as err:
+                logger.warn(f"MD5 校验失败：{path} {err}")
+        if not digests:
+            return
+        album_md5 = hashlib.md5("\n".join(sorted(digests)).encode("utf-8")).hexdigest()
+        logger.info(f"MD5 校验通过：{len(digests)} 个文件，专辑指纹 {album_md5}")
 
     def __get_download_url(self, seed: dict, site: CommentedMap, base_url: str):
         """
@@ -1438,6 +1674,10 @@ class IYUUAutoSeed(_PluginBase):
             """
             判断是否为特殊站点
             """
+            # 【补丁】带 {authkey}/{torrent_pass} 占位符的站点（Gazelle 架构，如海豚/52dic）
+            # 可以直接把凭据填进模板；不能走详情页抓取（Gazelle 详情页是 torrents.php 而非 details.php）
+            if "{authkey}" in base_url or "{torrent_pass}" in base_url:
+                return False
             spec_params = ["hash=", "authkey="]
             if any(field in base_url for field in spec_params):
                 return True
@@ -1466,6 +1706,15 @@ class IYUUAutoSeed(_PluginBase):
                 # 从详情页面获取下载链接
                 return self.__get_torrent_url_from_page(seed=seed, site=site)
             else:
+                # 【补丁】Gazelle 架构站点：把 authkey / torrent_pass 填进模板
+                extra = {}
+                if "{authkey}" in base_url or "{torrent_pass}" in base_url:
+                    authkey, torrent_pass = self.__get_gazelle_keys(site)
+                    if not authkey:
+                        logger.warn(f"{site.get('name')} 缺少 authkey，无法拼装下载链接")
+                        return None
+                    extra["authkey"] = authkey
+                    extra["torrent_pass"] = torrent_pass or (site.get("passkey") or "")
                 download_url = base_url.replace(
                     "id={}",
                     "id={id}"
@@ -1480,6 +1729,7 @@ class IYUUAutoSeed(_PluginBase):
                         "id": seed.get("torrent_id"),
                         "passkey": site.get("passkey") or '',
                         "uid": site.get("uid") or '',
+                        **extra,
                     }
                 )
                 if download_url.count("{"):

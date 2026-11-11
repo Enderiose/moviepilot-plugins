@@ -141,16 +141,17 @@
   },
   "IYUUAutoSeed": {
     "name": "IYUU自动辅种",
-    "description": "基于IYUU官方Api实现自动辅种。",
+    "description": "基于IYUU官方Api实现自动辅种。（本地补丁 2.23：支持 Gazelle 架构站点 authkey/torrent_pass、架构自适应保存路径、可选 MD5 校验）",
     "labels": "",
-    "version": "2.22",
+    "version": "2.23",
     "icon": "IYUU.png",
     "author": "jxxghp,CKun",
     "level": 1,
     "v3": false,
     "release": true,
     "history": {
-      "2.22": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+      "2.22": "备份快照 2026-11-07（源码原样，无上游 history 记录）",
+      "2.23": "本地补丁 2026-11-11：①新增 Gazelle 架构站点（海豚/52dic/dicmusic）authkey+torrent_pass 解析与缓存，修复「Url转换失败/详情页 404」导致辅种 100% 失败；②新增架构自适应保存路径（按文件名+大小重定位基准目录，解决目录层级不同导致 0% 校验）；③新增 bencode 头校验，挡掉站点流控返回的 HTML；④新增可选 MD5 校验（专辑指纹）。"
     }
   },
   "IyuuAuth": {
