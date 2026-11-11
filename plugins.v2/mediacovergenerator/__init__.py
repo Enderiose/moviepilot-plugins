@@ -1,64 +1,146 @@
 import base64
+import hmac
+import importlib.util
+import secrets
 import datetime
 import hashlib
+import json
 import mimetypes
 import os
 import re
-import ast
 import threading
 import time
 import shutil
 import random
+from collections import OrderedDict, defaultdict
+from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlparse, quote, unquote
+from urllib.parse import urlparse, quote
 from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict
 import pytz
 import yaml
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+from PIL import Image, ImageFont
 
 from app import schemas
 from app.chain.mediaserver import MediaServerChain
-from app.core.config import settings
-from app.core.event import eventmanager, Event
-from app.core.meta import MetaBase
-from app.helper.mediaserver import MediaServerHelper
-from app.log import logger
 from app.plugins import _PluginBase
-from app.schemas import MediaInfo, TransferInfo
-from app.schemas.types import EventType
-from app.schemas import ServiceInfo
-from app.utils.http import RequestUtils
-from app.utils.url import UrlUtils
-from app.plugins.mediacovergenerator.style.style_static_1 import create_style_static_1
-from app.plugins.mediacovergenerator.style.style_static_2 import create_style_static_2
-from app.plugins.mediacovergenerator.style.style_static_3  import create_style_static_3
-from app.plugins.mediacovergenerator.style.style_static_4 import create_style_static_4
-from app.plugins.mediacovergenerator.style.style_animated_1 import create_style_animated_1
-from app.plugins.mediacovergenerator.style.style_animated_2 import create_style_animated_2
-from app.plugins.mediacovergenerator.style.style_animated_3 import create_style_animated_3
-from app.plugins.mediacovergenerator.style.style_animated_4 import create_style_animated_4
-from app.plugins.mediacovergenerator.utils.image_manager import ResolutionConfig, ImageResourceManager
+from app.schemas.types import EventType, NotificationType
+
+try:
+    # MoviePilot V3
+    from app.sdk.config import settings
+    from app.sdk.events import eventmanager, Event
+    from app.sdk.services import MediaServerHelper
+    from app.sdk.logging import logger
+    from app.sdk.media import MediaInfo
+    from app.sdk.network import RequestUtils, UrlUtils
+except ImportError:
+    # MoviePilot V2
+    from app.core.config import settings
+    from app.core.event import eventmanager, Event
+    from app.helper.mediaserver import MediaServerHelper
+    from app.log import logger
+    from app.schemas import MediaInfo
+    from app.utils.http import RequestUtils
+    from app.utils.url import UrlUtils
+
+from app.plugins.mediacovergenerator.style.catalog import STYLE_CATALOG, TypeSpec, apply_overrides, style_info
+from app.plugins.mediacovergenerator.style.covers import create_cover
+from app.plugins.mediacovergenerator.style.framing import ALT_SUFFIX, IMAGE_EXTENSIONS
+from app.plugins.mediacovergenerator.style.typography import is_cjk_text
+from app.plugins.mediacovergenerator.style.quality import ACCEPT_SCORE, assess, rank
+from app.plugins.mediacovergenerator.ui import (
+    STYLE_COUNT,
+    PAGE_TABS,
+    build_form,
+    build_page,
+    default_form_model,
+    style_label,
+)
+from app.plugins.mediacovergenerator.utils.image_manager import ResolutionConfig
 from app.plugins.mediacovergenerator.utils.network_helper import NetworkHelper, validate_font_file
-from app.plugins.mediacovergenerator.utils.performance_helper import PerformanceMonitor, ProgressTracker, memory_efficient_operation
-from app.plugins.mediacovergenerator.utils.color_helper import ColorHelper
+from app.plugins.mediacovergenerator.utils.performance_helper import memory_efficient_operation
+
+STATIC_STYLES = {f"static_{index}" for index in range(1, STYLE_COUNT + 1)}
+ANIMATED_STYLES = {f"animated_{index}" for index in range(1, STYLE_COUNT + 1)}
+ALL_STYLES = STATIC_STYLES | ANIMATED_STYLES
+
+# 插件保存的封面文件名：时间戳[__媒体库名].扩展名（旧版本只有时间戳）
+COVER_NAME_PATTERN = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})(?:__(.+))?\.(jpg|jpeg|png|gif|apng|webp)$",
+    re.IGNORECASE,
+)
+LIVE_TV_TYPE = "livetv"
+# 下载的素材：N.jpg 是这个条目的首选图，N.alt.jpg 是另一种比例的图
+NUMBERED_IMAGE_PATTERN = re.compile(r"^[1-9][0-9]*(\.alt)?\.jpg$", re.IGNORECASE)
+# 素材的长边上限。封面最大 1920 宽，再大只会多花下载时间
+MATERIAL_MAX_SIZE = 1920
+# 字体选「跟随风格」时，字体、字号、字距都由风格决定
+AUTO_FONT = "auto"
+FONT_BASE_URL = "https://raw.githubusercontent.com/wio-ki/MoviePilot-Plugins/main/fonts/"
+FONT_FILES = {
+    "glowbold": "glowbold.otf",
+    "glowheavy": "glowheavy.otf",
+    "glowcond": "glowcond.otf",
+    "serifblack": "serifblack.otf",
+    "notoblack": "notoblack.otf",
+    "notolight": "notolight.otf",
+    "smiley": "smiley.ttf",
+    "pangmen": "pangmen.ttf",
+    "interbold": "interbold.ttf",
+    "interblack": "interblack.ttf",
+    "intersemi": "intersemi.ttf",
+    "anton": "anton.ttf",
+    "dmserif": "dmserif.ttf",
+    "poppinsxb": "poppinsxb.ttf",
+    "poppinssemi": "poppinssemi.ttf",
+    "kronaone": "kronaone.ttf",
+    "michroma": "michroma.ttf",
+    "CaveatBrush": "caveatbrush.ttf",
+    "EmblemaOne": "EmblemaOne.woff2",
+    "Melete": "Melete.otf",
+    "JosefinSans": "josefinsans.woff2",
+    "LilitaOne": "lilitaone.woff2",
+}
+# 字体下载失败时退回这些体积较小的字体，不让封面因为缺字体而生成失败
+FONT_FALLBACKS = {
+    "glowbold": "smiley", "glowheavy": "smiley", "glowcond": "smiley", "serifblack": "smiley",
+    "notoblack": "smiley", "notolight": "smiley", "pangmen": "smiley", "smiley": "notoblack",
+    "interbold": "JosefinSans", "interblack": "JosefinSans", "intersemi": "JosefinSans",
+    "anton": "JosefinSans", "dmserif": "JosefinSans", "poppinsxb": "JosefinSans", "poppinssemi": "JosefinSans",
+    "kronaone": "JosefinSans", "michroma": "JosefinSans", "CaveatBrush": "JosefinSans",
+}
+# 字库最全的字体：风格字体缺字时（比如繁体、日文片名）换成它，不出现方框
+WIDEST_FONT = "glowbold"
+ANIMATION_RESOLUTIONS = ("320x180", "400x225", "480x270")
+DEFAULT_ANIMATION_RESOLUTION = "400x225"
+HISTORY_PAGE_SIZE = 8
+# 选图：候选是需要数量的几倍，最多多少个，评分用的小图尺寸
+SELECTION_POOL_FACTOR = 3
+SELECTION_POOL_MAX = 36
+SELECTION_PREVIEW_SIZE = 480
+# 本地预览的动图尺寸，和图库卡片差不多大
+PREVIEW_SIZE = (320, 180)
+LIBRARY_CACHE_SECONDS = 120
+THUMBNAIL_CACHE_SIZE = 256
 
 
 class MediaCoverGenerator(_PluginBase):
     # 插件名称
-    plugin_name = "Emby媒体库封面生成"
+    plugin_name = "动态封面工坊"
     # 插件描述
-    plugin_desc = "生成媒体库动态/静态封面，支持 Emby/Jellyfin"
-    # 插件图标
-    plugin_icon = "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/icons/emby.png"
+    plugin_desc = "让媒体库封面动起来：8 款 GIF 动态风格，Hills、yamby、小幻影视都能播放，支持 Emby/Jellyfin"
+    # 插件图标（前端按地址缓存图标，换图时要换文件名）
+    plugin_icon = "https://raw.githubusercontent.com/wio-ki/MoviePilot-Plugins/main/icons/animated-cover.png"
     # 插件版本
-    plugin_version = "0.9.7"
+    plugin_version = "0.18.1"
     # 插件作者
-    plugin_author = "呀哈哈"
+    plugin_author = "Kioo"
     # 作者主页
-    author_url = "https://github.com/justzerock/MoviePilot-Plugins"
+    author_url = "https://github.com/wio-ki"
     # 插件配置项ID前缀
     plugin_config_prefix = "mediacovergenerator_"
     # 加载顺序
@@ -68,9 +150,6 @@ class MediaCoverGenerator(_PluginBase):
 
     # 退出事件
     _event = threading.Event()
-    # 立即生成任务互斥（防止并发触发导致卡死）
-    _generate_lock = threading.Lock()
-    _generate_running = False
 
     # 私有属性
     _scheduler = None
@@ -79,8 +158,10 @@ class MediaCoverGenerator(_PluginBase):
     _enabled = False
     _update_now = False
     _transfer_monitor = True
+    _notify = False
     _cron = None
     _delay = 60
+    _rotate_style = False
     _servers = None
     _selected_servers = []
     _all_libraries = []
@@ -90,46 +171,47 @@ class MediaCoverGenerator(_PluginBase):
     _current_updating_items = set()
     _covers_output = ''
     _covers_input = ''
+    # 正在生成本地预览：用固定的预览参数，不记入封面历史
+    _preview_mode = False
     _zh_font_url = ''
     _en_font_url = ''
     _zh_font_path = ''
     _en_font_path = ''
     _title_config = ''
     _current_config = {}
-    _cover_style = 'static_1'
+    _cover_style = 'animated_1'
     _cover_style_base = 'static_1'
-    _cover_style_variant = 'static'
+    _cover_style_variant = 'animated'
+    _library_styles = {}
+    _style_target = ''
     _font_path = ''
     _covers_path = ''
     _tab = 'style-tab'
-    _multi_1_blur = True
     _zh_font_size = None
     _en_font_size = None
     _blur_size = 50
     _color_ratio = 0.8
-    _use_primary = False
+    _use_primary = "auto"
     _seen_keys = set()
     _zh_font_custom = ''
     _en_font_custom = ''
-    _zh_font_preset = 'chaohei'
-    _en_font_preset = 'EmblemaOne'
+    _zh_font_preset = AUTO_FONT
+    _en_font_preset = AUTO_FONT
     _zh_font_offset = ''
     _title_spacing = ''
     _en_line_spacing = ''
+    _zh_letter_spacing = None
+    _en_letter_spacing = None
     _title_scale = 1.0
-    _request_timeout = 30
-    _resolution = '480p'
+    _resolution = '720p'
     _custom_width = 1920
     _custom_height = 1080
     _resolution_config = None
-    _animation_duration = 8
-    _animation_scroll = 'alternate'
-    _animation_fps = 24
-    _animation_format = 'apng'
-    _animation_resolution = '320x180'
+    _animation_duration = 12
+    _animation_fps = 15
+    _animation_resolution = DEFAULT_ANIMATION_RESOLUTION
     _animation_reduce_colors = 'medium'
-    _animated_2_image_count = 6
-    _animated_2_departure_type = 'fly'
+    _animation_image_count = 6
     _style_naming_v2 = True
     _sanitize_log_cache = set()
     _clean_images = False
@@ -137,37 +219,70 @@ class MediaCoverGenerator(_PluginBase):
     _save_recent_covers = True
     _covers_history_limit_per_library = 10
     _covers_page_history_limit = 50
-    _page_tab = "generate-tab"
+    _page_tab = "style"
+    _bg_color_mode = "auto"
+    _custom_bg_color = ""
+    _title_config_error = ""
+    _failure_reason = ""
 
     def __init__(self):
         super().__init__()
+        self._event = threading.Event()
+        self._update_lock = threading.Lock()
+        self._current_updating_items = set()
+        self._seen_keys = set()
+        self._sanitize_log_cache = set()
+        self._run_style = None
+        self._pending_history: List[Any] = []
+        self._preview_stocked = False
+        self._task: Dict[str, Any] = {"running": False}
+        self._monitor_lock = threading.Lock()
+        self._monitor_pending: Dict[str, Any] = {}
+        self._monitor_timer = None
+        self._monitor_batch_updated: set = set()
+        self._thumbnail_cache: "OrderedDict[Tuple[Any, ...], str]" = OrderedDict()
+        self._thumbnail_lock = threading.Lock()
+        self._library_cache: Dict[str, Tuple[float, List[Dict[str, str]]]] = {}
+        self._history_visible = HISTORY_PAGE_SIZE
+        self._clean_armed = ""
 
     def init_plugin(self, config: dict = None):
+        # 重新加载前先停止旧任务；旧任务还在收尾时保留停止信号，由它结束时清除
+        self.stop_service()
         self.mschain = MediaServerChain()
-        self.mediaserver_helper = MediaServerHelper()   
+        self.mediaserver_helper = MediaServerHelper()
+        self._servers = {}
+        self._all_libraries = []
+        self._library_cache = {}
+        self._monitor_sort = ''
+        if not self._update_lock.locked():
+            self._current_updating_items.clear()
+            self._event.clear()
         data_path = self.get_data_path()
         (data_path / 'fonts').mkdir(parents=True, exist_ok=True)
         (data_path / 'input').mkdir(parents=True, exist_ok=True)
         self._covers_path = data_path / 'input'
         self._font_path = data_path / 'fonts'
+        self._library_styles = self.__load_library_styles()
         if config:
             self._enabled = config.get("enabled")
             self._update_now = config.get("update_now")
             self._transfer_monitor = config.get("transfer_monitor")
+            self._notify = bool(config.get("notify", False))
             self._cron = config.get("cron")
+            self._rotate_style = bool(config.get("rotate_style", False))
             self._delay = config.get("delay")
             self._selected_servers = config.get("selected_servers")
             self._include_libraries = config.get("include_libraries")
             self._sort_by = config.get("sort_by")
             self._covers_output = config.get("covers_output")
             self._covers_input = config.get("covers_input")
-            # self._title_config = self.get_data('title_config')
             self._title_config = config.get("title_config")
             self._zh_font_url = config.get("zh_font_url")
             self._en_font_url = config.get("en_font_url")
             self._zh_font_path = config.get("zh_font_path")
             self._en_font_path = config.get("en_font_path")
-            self._cover_style = config.get("cover_style", "static_1")
+            self._cover_style = config.get("cover_style", "animated_1")
 
             # 样式命名升级兼容（仅对旧配置执行一次迁移）
             if not config.get("style_naming_v2"):
@@ -181,55 +296,29 @@ class MediaCoverGenerator(_PluginBase):
             self._cover_style_base = config.get("cover_style_base", default_base)
             self._cover_style_variant = config.get("cover_style_variant", default_variant)
             self._cover_style = self.__compose_cover_style(self._cover_style_base, self._cover_style_variant)
-            self._multi_1_blur = config.get("multi_1_blur", True)
-            self._zh_font_size = config.get("zh_font_size", 170)
-            self._en_font_size = config.get("en_font_size", 75)
-            try:
-                self._blur_size = int(config.get("blur_size", 50))
-            except (ValueError, TypeError):
-                self._blur_size = 50
-            try:
-                self._color_ratio = float(config.get("color_ratio", 0.8))
-            except (ValueError, TypeError):
-                self._color_ratio = 0.8
-            self._use_primary = config.get("use_primary")
-            self._zh_font_custom = config.get("zh_font_custom", "")
-            self._en_font_custom = config.get("en_font_custom", "")
-            self._zh_font_preset = config.get("zh_font_preset", "chaohei")
-            self._en_font_preset = config.get("en_font_preset", "EmblemaOne")
+            self._zh_font_size = config.get("zh_font_size")
+            self._en_font_size = config.get("en_font_size")
+            self._blur_size = self.__to_number(config.get("blur_size"), 50, int)
+            self._color_ratio = self.__to_number(config.get("color_ratio"), 0.8, float)
+            self._use_primary = config.get("use_primary", "auto")
+            self._zh_font_custom = config.get("zh_font_custom") or ""
+            self._en_font_custom = config.get("en_font_custom") or ""
+            self._zh_font_preset = config.get("zh_font_preset", AUTO_FONT)
+            self._en_font_preset = config.get("en_font_preset", AUTO_FONT)
             self._zh_font_offset = config.get("zh_font_offset")
             self._title_spacing = config.get("title_spacing")
             self._en_line_spacing = config.get("en_line_spacing")
-            try:
-                self._title_scale = float(config.get("title_scale", 1.0))
-            except (ValueError, TypeError):
-                self._title_scale = 1.0
-            self._request_timeout = self.__clamp_value(
-                config.get("request_timeout", 30),
-                5,
-                120,
-                30,
-                "request_timeout[init_plugin]",
-                int,
-            )
-            self._resolution = config.get("resolution", "480p")
+            self._zh_letter_spacing = config.get("zh_letter_spacing")
+            self._en_letter_spacing = config.get("en_letter_spacing")
+            self._title_scale = self.__to_number(config.get("title_scale"), 1.0, float)
+            self._resolution = config.get("resolution", "720p")
             self._custom_width = config.get("custom_width", 1920)
             self._custom_height = config.get("custom_height", 1080)
-            try:
-                self._animation_duration = int(config.get("animation_duration", 12))
-            except (ValueError, TypeError):
-                self._animation_duration = 12
-            self._animation_scroll = config.get("animation_scroll", "alternate")
-            try:
-                self._animation_fps = int(config.get("animation_fps", 12))
-            except (ValueError, TypeError):
-                self._animation_fps = 12
-            self._animation_format = config.get("animation_format", "apng")
-            if self._animation_format == "webp":
-                self._animation_format = "gif"
-            if self._animation_format not in ["apng", "gif"]:
-                self._animation_format = "apng"
-            self._animation_resolution = config.get("animation_resolution", "320x180")
+            self._animation_duration = self.__clamp_value(
+                self.__to_number(config.get("animation_duration"), 12, int), 1, 60, 12, "animation_duration", int)
+            self._animation_fps = self.__clamp_value(
+                self.__to_number(config.get("animation_fps"), 15, int), 1, 30, 15, "animation_fps", int)
+            self._animation_resolution = config.get("animation_resolution", DEFAULT_ANIMATION_RESOLUTION)
             animation_reduce_colors = config.get("animation_reduce_colors", "medium")
             if isinstance(animation_reduce_colors, bool):
                 self._animation_reduce_colors = "medium" if animation_reduce_colors else "off"
@@ -238,8 +327,7 @@ class MediaCoverGenerator(_PluginBase):
             else:
                 self._animation_reduce_colors = "medium"
 
-            self._animated_2_image_count = config.get("animated_2_image_count", 6)
-            self._animated_2_departure_type = config.get("animated_2_departure_type", "fly")
+            self._animation_image_count = config.get("animation_image_count", config.get("animated_2_image_count", 6))
             self._clean_images = config.get("clean_images", False)
             self._clean_fonts = config.get("clean_fonts", False)
             self._save_recent_covers = config.get("save_recent_covers", True)
@@ -259,49 +347,71 @@ class MediaCoverGenerator(_PluginBase):
                 "covers_page_history_limit[init_plugin]",
                 int,
             )
-            self._page_tab = config.get("page_tab", "generate-tab")
 
-            if self._resolution not in ["1080p", "720p", "480p"]:
-                self._resolution = "480p"
-            self._animation_resolution = "320x180"
+        self._enabled = bool(self._enabled)
+        self._transfer_monitor = bool(self._transfer_monitor)
+        self._selected_servers = self._selected_servers or []
+        self._include_libraries = self._include_libraries or []
+        try:
+            self._delay = max(0, int(self._delay or 0))
+        except (TypeError, ValueError):
+            logger.warning(f"入库延迟配置非法 ({self._delay})，已回退为 60 秒")
+            self._delay = 60
 
-        self._animated_2_image_count = self.__clamp_value(
-            self._animated_2_image_count,
-            3,
-            9,
-            5,
-            "animated_2 image_count[init_plugin]",
-            int,
+        if self._resolution not in ["1080p", "720p", "480p"]:
+            self._resolution = "720p"
+        if self._animation_resolution not in ANIMATION_RESOLUTIONS:
+            self._animation_resolution = DEFAULT_ANIMATION_RESOLUTION
+
+        self._animation_image_count = self.__clamp_value(
+            self._animation_image_count, 3, 12, 6, "animation_image_count[init_plugin]", int,
         )
-        if self._animated_2_departure_type not in ["fly", "fade", "crossfade"]:
-            self._animated_2_departure_type = "fly"
-        if self._animation_scroll not in ["down", "up", "alternate", "alternate_reverse"]:
-            self._animation_scroll = "alternate"
         self._bg_color_mode = (config or {}).get("bg_color_mode", "auto")
         self._custom_bg_color = (config or {}).get("custom_bg_color", "")
+
+        # 旧版本提供过实际不存在的字体预设，这里回退到跟随风格
+        valid_fonts = {spec["value"] for spec in self.__font_specs()}
+        if self._zh_font_preset not in valid_fonts:
+            self._zh_font_preset = AUTO_FONT
+        if self._en_font_preset not in valid_fonts:
+            self._en_font_preset = AUTO_FONT
+        typography_migrated = bool(config) and not config.get("covers_v3") and self.__migrate_redesign(config)
+        if config and not config.get("covers_v5"):
+            # 1.5.0 再次重做了全部风格和字体
+            typography_migrated = self.__reset_typography()
+            logger.info("封面风格和字体已全部更新，字体排版改为跟随风格，可以在设置的「字体排版」页调整")
+        if config and not config.get("covers_v6"):
+            # 1.7.0 起每个画框自动选海报或背景图。旧版的「海报」选项会把海报裁进宽画幅，这里改回自动一次
+            self._use_primary = "auto"
+            typography_migrated = True
+
+        self._title_config_error = ""
+        if self._title_config:
+            self.__load_title_config(self._title_config)
 
         # 初始化分辨率配置（确保安全初始化）
         try:
             self._resolution_config = ResolutionConfig(self._resolution)
         except Exception as e:
             logger.warning(f"分辨率配置初始化失败，使用默认配置: {e}")
-            self._resolution_config = ResolutionConfig("480p")
+            self._resolution_config = ResolutionConfig("720p")
 
         if self._selected_servers:
             self._servers = self.mediaserver_helper.get_services(
                 name_filters=self._selected_servers
-            )
+            ) or {}
             self._all_libraries = []
             for server, service in self._servers.items():
-                if not service.instance.is_inactive():
-                    self._all_libraries.extend(self.__get_all_libraries(server, service))
-                else:
-                    logger.info(f"媒体服务器 {server} 未连接")
+                try:
+                    if not service.instance.is_inactive():
+                        self._all_libraries.extend(self.__get_all_libraries(server, service))
+                    else:
+                        logger.info(f"媒体服务器 {server} 未连接")
+                except Exception as error:
+                    # 媒体服务器不可用不应该影响插件加载
+                    logger.warning(f"读取媒体服务器 {server} 的媒体库失败: {error}")
         else:
             logger.info("未选择媒体服务器")
-        
-        # 停止现有任务
-        self.stop_service()
 
         cleanup_triggered = False
         if self._clean_images:
@@ -312,7 +422,7 @@ class MediaCoverGenerator(_PluginBase):
             self.__clean_downloaded_fonts()
             self._clean_fonts = False
             cleanup_triggered = True
-        if cleanup_triggered:
+        if cleanup_triggered or typography_migrated:
             self.__update_config()
 
         if self._update_now:
@@ -331,6 +441,17 @@ class MediaCoverGenerator(_PluginBase):
                 self._scheduler.print_jobs()
                 self._scheduler.start()
 
+    @staticmethod
+    def __to_number(value, default, cast_type):
+        """把表单值转成数字；空值或非法值返回默认值。"""
+        if value is None or value == "":
+            return default
+        try:
+            return cast_type(float(value)) if cast_type is int else cast_type(value)
+        except (TypeError, ValueError):
+            logger.warning(f"配置值非法 ({value})，已回退默认值 {default}")
+            return default
+
     def __clamp_value(self, value, minimum, maximum, default_value, name, cast_type):
         try:
             parsed = cast_type(value)
@@ -345,61 +466,83 @@ class MediaCoverGenerator(_PluginBase):
 
         return parsed
 
-    def __get_animated_2_required_items(self) -> int:
-        self._animated_2_image_count = self.__clamp_value(
-            self._animated_2_image_count,
-            3,
-            9,
-            5,
-            "animated_2 image_count[runtime]",
-            int,
-        )
-        return int(self._animated_2_image_count)
-
     def __compose_cover_style(self, base_style: str, variant: str) -> str:
-        base = base_style if base_style in ["static_1", "static_2", "static_3", "static_4"] else "static_1"
-        mode = variant if variant in ["static", "animated"] else "static"
+        base = base_style if base_style in STATIC_STYLES else "static_1"
+        mode = variant if variant in ["static", "animated"] else "animated"
         suffix = base.split("_")[-1]
         return base if mode == "static" else f"animated_{suffix}"
 
     def __resolve_cover_style_ui(self, cover_style: str) -> Tuple[str, str]:
-        if cover_style in ["animated_1", "animated_2", "animated_3", "animated_4"]:
-            suffix = cover_style.split("_")[-1]
-            if suffix == "4":
-                return "static_4", "animated"
-            return f"static_{suffix}", "animated"
-        if cover_style in ["static_1", "static_2", "static_3", "static_4"]:
+        if cover_style in ANIMATED_STYLES:
+            return f"static_{cover_style.split('_')[-1]}", "animated"
+        if cover_style in ALL_STYLES:
             return cover_style, "static"
-        return "static_1", "static"
+        return "static_1", "animated"
 
-    def __is_single_image_style(self) -> bool:
-        return self._cover_style in ["static_1", "static_2", "static_4"]
+    def __load_library_styles(self) -> Dict[str, str]:
+        """媒体库单独设置的风格存在插件数据里，这样保存设置页时不会被表单内容覆盖。"""
+        stored = self.get_data("library_styles")
+        if not isinstance(stored, dict):
+            return {}
+        return {str(key): style for key, style in stored.items() if style in ALL_STYLES}
+
+    def __library_style(self, key: str) -> str:
+        """媒体库实际使用的风格：单独设置过的用自己的，其余跟随默认风格。"""
+        return self._library_styles.get(key) or self._cover_style
+
+    def __set_library_style(self, key: str, style: Optional[str]):
+        """保存媒体库的单独风格；style 为空表示恢复跟随默认。"""
+        if style:
+            self._library_styles[key] = style
+        else:
+            self._library_styles.pop(key, None)
+        self.save_data("library_styles", self._library_styles)
+        logger.info(f"【MediaCoverGenerator】媒体库 {key} 的风格已设为: {style or '跟随默认'}")
+
+    def __current_style(self) -> str:
+        """当前生成使用的风格。任务开始时固定下来，运行中切换风格不影响正在处理的媒体库。"""
+        return self._run_style or self._cover_style
+
+    def __current_index(self) -> int:
+        try:
+            return max(1, min(STYLE_COUNT, int(self.__current_style().split("_")[-1])))
+        except (TypeError, ValueError):
+            return 1
+
+    def __style_item_count(self) -> int:
+        """静态封面用满一屏；动图还要加上轮播用的图，转场时才有新内容。"""
+        slots = style_info(self.__current_index()).slots
+        if self.__current_style() in ANIMATED_STYLES:
+            return max(slots, int(self._animation_image_count))
+        return slots
 
     def __get_required_items(self) -> int:
-        if self._cover_style in ["static_3", "animated_3"]:
-            return 9
-        if self._cover_style in ["animated_1", "animated_2", "animated_4"]:
-            return self.__get_animated_2_required_items()
-        return 1
+        """这一轮要准备多少个条目的素材。预览的 8 款风格共用一批素材，要够最多的那款用。"""
+        if self._preview_mode:
+            return max(max(entry.slots for entry in STYLE_CATALOG), int(self._animation_image_count))
+        return self.__style_item_count()
+
+    def __prefer_primary(self) -> bool:
+        """优先下载海报还是背景图。默认跟随风格：竖向构图用海报，满幅构图用背景图。"""
+        if self._use_primary in (None, "", "auto"):
+            return style_info(self.__current_index()).poster
+        return bool(self._use_primary)
 
     def __update_config(self):
         """
         更新配置
         """
         self._cover_style = self.__compose_cover_style(self._cover_style_base, self._cover_style_variant)
-        self._animated_2_image_count = self.__clamp_value(
-            self._animated_2_image_count,
-            3,
-            9,
-            5,
-            "animated_2 image_count[save]",
-            int,
+        self._animation_image_count = self.__clamp_value(
+            self._animation_image_count, 3, 12, 6, "animation_image_count[save]", int,
         )
         self.update_config({
             "enabled": self._enabled,
             "update_now": self._update_now,
             "transfer_monitor": self._transfer_monitor,
+            "notify": self._notify,
             "cron": self._cron,
+            "rotate_style": self._rotate_style,
             "delay": self._delay,
             "selected_servers": self._selected_servers,
             "include_libraries": self._include_libraries,
@@ -408,14 +551,13 @@ class MediaCoverGenerator(_PluginBase):
             "covers_output": self._covers_output,
             "covers_input": self._covers_input,
             "title_config": self._title_config,
-            "zh_font_url": str(self._zh_font_url),
-            "en_font_url": str(self._en_font_url),
-            "zh_font_path": str(self._zh_font_path),
-            "en_font_path": str(self._en_font_path),
+            "zh_font_url": str(self._zh_font_url or ""),
+            "en_font_url": str(self._en_font_url or ""),
+            "zh_font_path": str(self._zh_font_path or ""),
+            "en_font_path": str(self._en_font_path or ""),
             "cover_style": self._cover_style,
             "cover_style_base": self._cover_style_base,
             "cover_style_variant": self._cover_style_variant,
-            "multi_1_blur": self._multi_1_blur,
             "zh_font_size": self._zh_font_size,
             "en_font_size": self._en_font_size,
             "blur_size": self._blur_size,
@@ -428,19 +570,18 @@ class MediaCoverGenerator(_PluginBase):
             "zh_font_offset": self._zh_font_offset,
             "title_spacing": self._title_spacing,
             "en_line_spacing": self._en_line_spacing,
+            "zh_letter_spacing": self._zh_letter_spacing,
+            "en_letter_spacing": self._en_letter_spacing,
+            "covers_v3": True,
+            "covers_v5": True,
+            "covers_v6": True,
             "title_scale": self._title_scale,
-            "request_timeout": self._request_timeout,
             "resolution": self._resolution,
-            "custom_width": self._custom_width,
-            "custom_height": self._custom_height,
             "animation_duration": self._animation_duration,
-            "animation_scroll": self._animation_scroll,
             "animation_fps": self._animation_fps,
-            "animation_format": self._animation_format,
             "animation_resolution": self._animation_resolution,
             "animation_reduce_colors": self._animation_reduce_colors,
-            "animated_2_image_count": self._animated_2_image_count,
-            "animated_2_departure_type": self._animated_2_departure_type,
+            "animation_image_count": self._animation_image_count,
             "bg_color_mode": self._bg_color_mode,
             "custom_bg_color": self._custom_bg_color,
             "clean_images": self._clean_images,
@@ -448,7 +589,6 @@ class MediaCoverGenerator(_PluginBase):
             "save_recent_covers": self._save_recent_covers,
             "covers_history_limit_per_library": self._covers_history_limit_per_library,
             "covers_page_history_limit": self._covers_page_history_limit,
-            "page_tab": self._page_tab,
             "style_naming_v2": True,
         })
 
@@ -485,6 +625,9 @@ class MediaCoverGenerator(_PluginBase):
                 if suffix not in normalized_exts:
                     continue
                 stem = font_file.stem.lower()
+                # 自定义链接下载的字体不能冒充预设字体
+                if stem.endswith("_custom"):
+                    continue
                 name = font_file.name.lower()
                 stem_compact = re.sub(r'[\s_\-]+', '', stem)
                 name_compact = re.sub(r'[\s_\-]+', '', name)
@@ -495,86 +638,120 @@ class MediaCoverGenerator(_PluginBase):
                     return str(font_file)
         return None
 
-    def __get_font_presets(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], Dict[str, Optional[str]], Dict[str, Optional[str]]]:
-        zh_specs = [
-            {"title": "潮黑", "value": "chaohei", "aliases": ["chaohei", "wendao", "潮黑", "chao_hei"]},
-            {"title": "粗雅宋", "value": "yasong", "aliases": ["yasong", "粗雅宋", "multi_1_zh", "ya_song"]},
+    @staticmethod
+    def __font_specs() -> List[Dict[str, Any]]:
+        return [
+            {"title": "跟随风格", "value": AUTO_FONT, "cjk": True, "aliases": []},
+            {"title": "未来荧黑 Bold", "value": "glowbold", "cjk": True, "aliases": ["glowbold"]},
+            {"title": "未来荧黑 Heavy", "value": "glowheavy", "cjk": True, "aliases": ["glowheavy"]},
+            {"title": "未来荧黑长体 Heavy", "value": "glowcond", "cjk": True, "aliases": ["glowcond"]},
+            {"title": "思源宋体 Black", "value": "serifblack", "cjk": True, "aliases": ["serifblack"]},
+            {"title": "思源黑体 Black", "value": "notoblack", "cjk": True, "aliases": ["notoblack"]},
+            {"title": "思源黑体 Light", "value": "notolight", "cjk": True, "aliases": ["notolight"]},
+            {"title": "得意黑", "value": "smiley", "cjk": True, "aliases": ["smiley", "得意黑"]},
+            {"title": "庞门正道粗书体", "value": "pangmen", "cjk": True, "aliases": ["pangmen", "庞门正道粗书体"]},
+            {"title": "Inter Bold", "value": "interbold", "cjk": False, "aliases": ["interbold"]},
+            {"title": "Inter Black", "value": "interblack", "cjk": False, "aliases": ["interblack"]},
+            {"title": "Inter SemiBold", "value": "intersemi", "cjk": False, "aliases": ["intersemi"]},
+            {"title": "Anton", "value": "anton", "cjk": False, "aliases": ["anton"]},
+            {"title": "DM Serif Display", "value": "dmserif", "cjk": False, "aliases": ["dmserif"]},
+            {"title": "Poppins ExtraBold", "value": "poppinsxb", "cjk": False, "aliases": ["poppinsxb"]},
+            {"title": "Poppins SemiBold", "value": "poppinssemi", "cjk": False, "aliases": ["poppinssemi"]},
+            {"title": "Krona One", "value": "kronaone", "cjk": False, "aliases": ["kronaone", "krona_one"]},
+            {"title": "Michroma", "value": "michroma", "cjk": False, "aliases": ["michroma"]},
+            {"title": "CaveatBrush", "value": "CaveatBrush", "cjk": False, "aliases": ["caveatbrush", "caveat_brush"]},
+            {"title": "EmblemaOne", "value": "EmblemaOne", "cjk": False, "aliases": ["emblemaone", "emblema_one"]},
+            {"title": "Melete", "value": "Melete", "cjk": False, "aliases": ["melete", "multi_1_en"]},
+            {"title": "JosefinSans", "value": "JosefinSans", "cjk": False, "aliases": ["josefinsans", "josefin_sans"]},
+            {"title": "LilitaOne", "value": "LilitaOne", "cjk": False, "aliases": ["lilitaone", "lilita_one"]},
         ]
-        en_specs = [
-            {"title": "EmblemaOne", "value": "EmblemaOne", "aliases": ["emblemaone", "emblema_one"]},
-            {"title": "Melete", "value": "Melete", "aliases": ["melete", "multi_1_en"]},
-            {"title": "Phosphate", "value": "Phosphate", "aliases": ["phosphate", "phosphat"]},
-            {"title": "JosefinSans", "value": "JosefinSans", "aliases": ["josefinsans", "josefin_sans"]},
-            {"title": "LilitaOne", "value": "LilitaOne", "aliases": ["lilitaone", "lilita_one"]},
-            {"title": "Monoton", "value": "Monoton", "aliases": ["monoton"]},
-            {"title": "Plaster", "value": "Plaster", "aliases": ["plaster"]},
-        ]
-        all_specs = []
-        seen_values = set()
-        for spec in zh_specs + en_specs:
-            if spec["value"] in seen_values:
-                continue
-            seen_values.add(spec["value"])
-            value_alias = spec["value"].lower()
-            compact_value_alias = re.sub(r'[\s_\-]+', '', value_alias)
-            if value_alias not in spec["aliases"]:
-                spec["aliases"].append(value_alias)
-            if compact_value_alias and compact_value_alias not in spec["aliases"]:
-                spec["aliases"].append(compact_value_alias)
-            title_alias = spec["title"].lower()
-            compact_title_alias = re.sub(r'[\s_\-]+', '', title_alias)
-            if title_alias not in spec["aliases"]:
-                spec["aliases"].append(title_alias)
-            if compact_title_alias and compact_title_alias not in spec["aliases"]:
-                spec["aliases"].append(compact_title_alias)
-            all_specs.append(spec)
-        zh_paths: Dict[str, Optional[str]] = {}
-        en_paths: Dict[str, Optional[str]] = {}
-        zh_items: List[Dict[str, str]] = []
-        en_items: List[Dict[str, str]] = []
-        zh_exts = [".ttf", ".otf", ".woff2", ".woff"]
-        en_exts = [".ttf", ".otf", ".woff2", ".woff"]
 
-        for spec in all_specs:
-            found = self.__find_font_file(spec["aliases"], zh_exts)
-            zh_paths[spec["value"]] = found
-            zh_items.append({"title": spec["title"], "value": spec["value"]})
-        for spec in all_specs:
-            found = self.__find_font_file(spec["aliases"], en_exts)
-            en_paths[spec["value"]] = found
-            en_items.append({"title": spec["title"], "value": spec["value"]})
-        return zh_items, en_items, zh_paths, en_paths
+    def __reset_typography(self) -> bool:
+        """
+        风格重做后，旧的字体选择、字号和字距是给旧构图调的，升级时清空，跟随新风格。
+        用户自己提供的字体链接或路径保留。
+        """
+        self._zh_font_preset = AUTO_FONT
+        self._en_font_preset = AUTO_FONT
+        self._zh_font_size = self._en_font_size = None
+        self._zh_font_offset = self._title_spacing = self._en_line_spacing = None
+        self._zh_letter_spacing = self._en_letter_spacing = None
+        self._title_scale = 1.0
+        return True
+
+    def __migrate_redesign(self, config: dict) -> bool:
+        """
+        从 1.3.0 之前升级：字体排版清空，动图的旧默认值换成适合 GIF 的新默认值。
+        """
+        self.__reset_typography()
+        self._blur_size = 50
+        self._color_ratio = 0.8
+        if not self._use_primary:
+            self._use_primary = "auto"
+        if self._resolution == "480p":
+            self._resolution = "720p"
+            self._resolution_config = None
+        if int(self._animation_duration) == 8 and int(self._animation_fps) == 24:
+            self._animation_duration = 12
+            self._animation_fps = 15
+        logger.info("封面风格已全部更新，字体排版改为跟随风格，可以在设置的「字体排版」页调整")
+        return True
+
+    def __get_font_presets(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]], Dict[str, Optional[str]], Dict[str, Optional[str]]]:
+        items: List[Dict[str, str]] = []
+        paths: Dict[str, Optional[str]] = {}
+        exts = [".ttf", ".otf", ".woff2", ".woff"]
+        for spec in self.__font_specs():
+            suffix = "" if spec["cjk"] else "（仅英文）"
+            items.append({"title": f"{spec['title']}{suffix}", "value": spec["value"]})
+            if spec["value"] == AUTO_FONT:
+                continue
+            aliases = [*spec["aliases"], spec["value"].lower(), spec["title"].lower()]
+            paths[spec["value"]] = self.__find_font_file(aliases, exts)
+        return items, list(items), paths, dict(paths)
 
     def __clean_generated_images(self):
         removed = 0
-        cache_dirs: List[Path] = []
-        if self._covers_path:
-            cache_dirs.append(Path(self._covers_path))
         data_path = self.get_data_path()
-        legacy_covers_dir = data_path / "covers"
-        cache_dirs.append(legacy_covers_dir)
+        # 插件自己的目录可以整体清空
+        owned_dirs: List[Path] = [data_path / "covers", data_path / "output", data_path / "preview"]
+        if self._covers_path:
+            owned_dirs.append(Path(self._covers_path))
 
         handled = set()
-        for cache_dir in cache_dirs:
-            if not cache_dir.exists() or not cache_dir.is_dir():
+        for cache_dir in owned_dirs:
+            if not cache_dir.is_dir():
                 continue
             cache_key = str(cache_dir.resolve())
             if cache_key in handled:
                 continue
             handled.add(cache_key)
             for entry in cache_dir.iterdir():
-                if not entry.exists():
-                    continue
                 try:
                     if entry.is_dir():
                         shutil.rmtree(entry)
-                        removed += 1
-                    elif entry.is_file():
+                    else:
                         entry.unlink(missing_ok=True)
-                        removed += 1
+                    removed += 1
                 except Exception as e:
                     logger.warning(f"清理图片失败 {entry}: {e}")
-        logger.info(f"清理图片完成（含旧版 covers 兼容目录），共清理 {removed} 项")
+
+        # 用户指定的保存目录里可能有别的文件，只删除插件生成的封面
+        if self._covers_output:
+            custom_dir = Path(self._covers_output).expanduser()
+            if custom_dir.is_dir() and str(custom_dir.resolve()) not in handled:
+                for entry in custom_dir.iterdir():
+                    if not entry.is_file() or not COVER_NAME_PATTERN.match(entry.name):
+                        continue
+                    try:
+                        entry.unlink(missing_ok=True)
+                        removed += 1
+                    except Exception as e:
+                        logger.warning(f"清理图片失败 {entry}: {e}")
+
+        with self._thumbnail_lock:
+            self._thumbnail_cache.clear()
+        logger.info(f"清理图片完成，共清理 {removed} 项")
 
     def __clean_downloaded_fonts(self):
         if not self._font_path or not Path(self._font_path).exists():
@@ -619,313 +796,435 @@ class MediaCoverGenerator(_PluginBase):
             "summary": "API说明"
         }]
         """
-        return [
-            {
-                "path": "/clean_images",
-                "endpoint": self.api_clean_images,
-                "auth": "bear",
-                "methods": ["POST"],
-                "summary": "立即清理封面图片缓存",
-            },
-            {
-                "path": "clean_images",
-                "endpoint": self.api_clean_images,
-                "auth": "bear",
-                "methods": ["POST"],
-                "summary": "立即清理封面图片缓存(兼容无前导斜杠)",
-            },
-            {
-                "path": "/clean_fonts",
-                "endpoint": self.api_clean_fonts,
-                "auth": "bear",
-                "methods": ["POST"],
-                "summary": "立即清理字体缓存",
-            },
-            {
-                "path": "clean_fonts",
-                "endpoint": self.api_clean_fonts,
-                "auth": "bear",
-                "methods": ["POST"],
-                "summary": "立即清理字体缓存(兼容无前导斜杠)",
-            },
-            {
-                "path": "/delete_saved_cover",
-                "endpoint": self.api_delete_saved_cover,
-                "auth": "bear",
-                "methods": ["POST", "GET"],
-                "summary": "删除一张已保存封面",
-            },
-            {
-                "path": "delete_saved_cover",
-                "endpoint": self.api_delete_saved_cover,
-                "auth": "bear",
-                "methods": ["POST", "GET"],
-                "summary": "删除一张已保存封面(兼容无前导斜杠)",
-            },
-            {
-                "path": "/generate_now",
-                "endpoint": self.api_generate_now,
-                "auth": "bear",
-                "methods": ["POST", "GET"],
-                "summary": "立即生成媒体库封面",
-            },
-            {
-                "path": "generate_now",
-                "endpoint": self.api_generate_now,
-                "auth": "bear",
-                "methods": ["POST", "GET"],
-                "summary": "立即生成媒体库封面(兼容无前导斜杠)",
-            },
-            {
-                "path": "/generate_status",
-                "endpoint": self.api_generate_status,
-                "auth": "bear",
-                "methods": ["GET"],
-                "summary": "查询立即生成任务状态",
-            },
-            {
-                "path": "generate_status",
-                "endpoint": self.api_generate_status,
-                "auth": "bear",
-                "methods": ["GET"],
-                "summary": "查询立即生成任务状态(兼容无前导斜杠)",
-            },
-            {
-                "path": "/set_cover_style",
-                "endpoint": self.api_set_cover_style,
-                "auth": "bear",
-                "methods": ["POST", "GET"],
-                "summary": "保存封面风格选择",
-            },
-            {
-                "path": "set_cover_style",
-                "endpoint": self.api_set_cover_style,
-                "auth": "bear",
-                "methods": ["POST", "GET"],
-                "summary": "保存封面风格选择(兼容无前导斜杠)",
-            },
-            {"path": "/toggle_style_variant", "endpoint": self.api_toggle_style_variant, "auth": "bear", "methods": ["POST"], "summary": "切换静态/动态"},
-            {"path": "toggle_style_variant", "endpoint": self.api_toggle_style_variant, "auth": "bear", "methods": ["POST"], "summary": "切换静态/动态(兼容)"},
-            {"path": "/select_style_1", "endpoint": self.api_select_style_1, "auth": "bear", "methods": ["POST"], "summary": "选择风格1"},
-            {"path": "/select_style_2", "endpoint": self.api_select_style_2, "auth": "bear", "methods": ["POST"], "summary": "选择风格2"},
-            {"path": "/select_style_3", "endpoint": self.api_select_style_3, "auth": "bear", "methods": ["POST"], "summary": "选择风格3"},
-            {"path": "/select_style_4", "endpoint": self.api_select_style_4, "auth": "bear", "methods": ["POST"], "summary": "选择风格4"},
-            {"path": "select_style_1", "endpoint": self.api_select_style_1, "auth": "bear", "methods": ["POST"], "summary": "选择风格1(兼容)"},
-            {"path": "select_style_2", "endpoint": self.api_select_style_2, "auth": "bear", "methods": ["POST"], "summary": "选择风格2(兼容)"},
-            {"path": "select_style_3", "endpoint": self.api_select_style_3, "auth": "bear", "methods": ["POST"], "summary": "选择风格3(兼容)"},
-            {"path": "select_style_4", "endpoint": self.api_select_style_4, "auth": "bear", "methods": ["POST"], "summary": "选择风格4(兼容)"},
-            {"path": "/set_page_tab_generate", "endpoint": self.api_set_page_tab_generate, "auth": "bear", "methods": ["POST"], "summary": "切换到生成页"},
-            {"path": "/set_page_tab_history", "endpoint": self.api_set_page_tab_history, "auth": "bear", "methods": ["POST"], "summary": "切换到历史页"},
-            {"path": "/set_page_tab_clean", "endpoint": self.api_set_page_tab_clean, "auth": "bear", "methods": ["POST"], "summary": "切换到清理页"},
-            {"path": "set_page_tab_generate", "endpoint": self.api_set_page_tab_generate, "auth": "bear", "methods": ["POST"], "summary": "切换到生成页(兼容)"},
-            {"path": "set_page_tab_history", "endpoint": self.api_set_page_tab_history, "auth": "bear", "methods": ["POST"], "summary": "切换到历史页(兼容)"},
-            {"path": "set_page_tab_clean", "endpoint": self.api_set_page_tab_clean, "auth": "bear", "methods": ["POST"], "summary": "切换到清理页(兼容)"},
-            {"path": "/saved_cover_image", "endpoint": self.api_saved_cover_image, "methods": ["GET"], "summary": "获取已保存封面图片"},
-            {"path": "saved_cover_image", "endpoint": self.api_saved_cover_image, "methods": ["GET"], "summary": "获取已保存封面图片(兼容)"},
+        routes = [
+            ("/clean_images", self.api_clean_images, "立即清理封面图片缓存"),
+            ("/clean_fonts", self.api_clean_fonts, "立即清理字体缓存"),
+            ("/delete_saved_cover", self.api_delete_saved_cover, "删除一张已保存封面"),
+            ("/generate_now", self.api_generate_now, "在后台生成媒体库封面"),
+            ("/stop_task", self.api_stop_task, "停止正在运行的生成任务"),
+            ("/refresh", self.api_refresh, "刷新详情页"),
+            ("/history_more", self.api_history_more, "显示更多历史封面"),
+            ("/set_cover_style", self.api_set_cover_style, "保存封面风格"),
+            ("/select_style", self.api_select_style, "按序号选择封面风格"),
+            ("/set_style_variant", self.api_set_style_variant, "切换静态或动态"),
+            ("/style_target", self.api_style_target, "选择要设置风格的媒体库"),
+            ("/clear_library_style", self.api_clear_library_style, "让媒体库恢复跟随默认风格"),
+            ("/generate_preview", self.api_generate_preview, "用媒体库的真实图片生成风格预览"),
+            ("/clear_preview", self.api_clear_preview, "删除本地预览，恢复示例图"),
         ]
+        response_model = self.__response_model()
+        result: List[Dict[str, Any]] = []
+        for path, endpoint, summary in routes:
+            # 部分 MoviePilot 版本要求路径不带前导斜杠，两种写法都注册
+            for route_path in (path, path.lstrip("/")):
+                route: Dict[str, Any] = {
+                    "path": route_path,
+                    "endpoint": endpoint,
+                    "auth": "bear",
+                    "methods": ["POST"],
+                    "summary": summary,
+                }
+                if response_model is not None:
+                    route["response_model"] = response_model
+                result.append(route)
+        for route_path in ("/saved_cover_image", "saved_cover_image"):
+            result.append({
+                "path": route_path,
+                "endpoint": self.api_saved_cover_image,
+                "methods": ["GET"],
+                "response_model": None,
+                "summary": "获取已保存封面图片",
+            })
+        # 图片标签带不了登录凭据，动态预览走匿名路由，靠每次生成都换的随机令牌保护，只能取到生成好的预览。
+        # 不支持匿名路由的 MoviePilot 版本不注册，页面上仍有内嵌的静态预览
+        if self.__supports_anonymous_route():
+            for route_path in ("/local_preview", "local_preview"):
+                result.append({
+                    "path": route_path,
+                    "endpoint": self.api_local_preview,
+                    "methods": ["GET"],
+                    "allow_anonymous": True,
+                    "response_model": None,
+                    "summary": "获取本地生成的风格预览",
+                })
+        return result
 
-    def api_clean_images(self):
+    @staticmethod
+    def __supports_anonymous_route() -> bool:
+        return importlib.util.find_spec("app.adapters.web.plugin.routes") is not None
+
+    @staticmethod
+    def __response_model():
+        response_model = getattr(schemas, "Response", None)
+        if response_model is None:
+            return None
+        try:
+            return response_model[Any]
+        except TypeError:
+            # V2 的 Response 不是泛型
+            return response_model
+
+    @classmethod
+    def __api_response(cls, success: bool, message: str = "", data: Any = None):
+        """同时满足 V3 的严格响应信封和 V2 的普通响应模型。"""
+        return cls.__response_model()(success=success, message=message, data=data)
+
+    def __api_prefix(self) -> str:
+        return f"plugin/{self.__class__.__name__}"
+
+    def __set_page_tab(self, tab: str):
+        """记住操作发生的页签，操作后页面刷新时停留在原处。"""
+        valid_tabs = {item[0] for item in PAGE_TABS}
+        if tab in valid_tabs:
+            self._page_tab = tab
+
+    def __confirm_clean(self, what: str) -> bool:
+        """清理不能撤销：第一次点只记下要清理什么，页面换成确认按钮，再点一次才执行。"""
+        if self._clean_armed != what:
+            self._clean_armed = what
+            return False
+        self._clean_armed = ""
+        return True
+
+    def api_clean_images(self, tab: str = ""):
+        self.__set_page_tab(tab)
+        if not self.__confirm_clean("images"):
+            return self.__api_response(True, "")
         try:
             logger.info("【MediaCoverGenerator】收到立即清理图片缓存请求")
             self.__clean_generated_images()
             self._clean_images = False
             self.__update_config()
-            return {"code": 0, "msg": "图片缓存清理完成"}
+            return self.__api_response(True, "图片缓存清理完成")
         except Exception as e:
             logger.error(f"【MediaCoverGenerator】立即清理图片失败: {e}", exc_info=True)
-            return {"code": 1, "msg": f"图片缓存清理失败: {e}"}
+            return self.__api_response(False, f"图片缓存清理失败: {e}")
 
-    def api_clean_fonts(self):
+    def api_clean_fonts(self, tab: str = ""):
+        self.__set_page_tab(tab)
+        if not self.__confirm_clean("fonts"):
+            return self.__api_response(True, "")
         try:
             logger.info("【MediaCoverGenerator】收到立即清理字体缓存请求")
             self.__clean_downloaded_fonts()
             self._clean_fonts = False
             self.__update_config()
-            return {"code": 0, "msg": "字体缓存清理完成"}
+            return self.__api_response(True, "字体缓存清理完成")
         except Exception as e:
             logger.error(f"【MediaCoverGenerator】立即清理字体失败: {e}", exc_info=True)
-            return {"code": 1, "msg": f"字体缓存清理失败: {e}"}
+            return self.__api_response(False, f"字体缓存清理失败: {e}")
 
-    def api_delete_saved_cover(self, file: str = ""):
+    def api_delete_saved_cover(self, file: str = "", tab: str = ""):
+        self.__set_page_tab(tab)
         try:
             target_file = self.__resolve_saved_cover_path(file)
             if not target_file:
-                return {"code": 1, "msg": "无效文件路径"}
-            if not target_file.exists() or not target_file.is_file():
-                return {"code": 1, "msg": "文件不存在"}
+                return self.__api_response(False, "文件不存在或不是插件生成的封面")
             target_file.unlink(missing_ok=True)
             logger.info(f"【MediaCoverGenerator】已删除封面文件: {target_file}")
-            return {"code": 0, "msg": "封面文件删除成功"}
+            return self.__api_response(True, "封面文件删除成功")
         except Exception as e:
             logger.error(f"【MediaCoverGenerator】删除封面文件失败: {e}", exc_info=True)
-            return {"code": 1, "msg": f"封面文件删除失败: {e}"}
+            return self.__api_response(False, f"封面文件删除失败: {e}")
 
-    def api_generate_now(self, style: str = ""):
-        old_style = self._cover_style
+    def api_generate_now(self, library: str = "", tab: str = ""):
+        """启动后台生成并立即返回，进度显示在详情页。"""
+        self.__set_page_tab(tab)
+        if not self._enabled:
+            return self.__api_response(False, "插件未启用，请先在设置页启用插件并保存")
+        if not self._selected_servers:
+            return self.__api_response(False, "未选择媒体服务器，请先在设置页选择并保存")
+        if not self._servers:
+            return self.__api_response(False, "媒体服务器连接信息为空，请检查设置并保存后重试")
+        if self.__is_running():
+            return self.__api_response(False, "已有封面生成任务正在运行")
+
+        # 先清除信号再标记运行中：任务线程启动的这段时间里点「停止」也不会丢失
+        self._event.clear()
+        task = {"running": True, "total": 0, "done": 0, "current": ""}
+        self._task = task
+        threading.Thread(
+            target=self.__run_in_background,
+            args=((library or "").strip() or None, task),
+            name="MediaCoverGenerator",
+            daemon=True,
+        ).start()
+        logger.info(f"【MediaCoverGenerator】已启动后台生成，风格: {self._cover_style}，媒体库: {library or '全部'}")
+        return self.__api_response(True, "封面生成任务已在后台启动")
+
+    def __run_in_background(self, library_key: Optional[str], task: Dict[str, Any]):
         try:
-            if not self._enabled:
-                logger.warning("【MediaCoverGenerator】立即生成失败：插件未启用，请先在设置页启用插件并保存")
-                return {"code": 1, "msg": "插件未启用，请先在设置页启用插件并保存"}
-            if not self._selected_servers:
-                logger.warning("【MediaCoverGenerator】立即生成失败：未勾选媒体服务器，请先在设置页勾选服务器并保存")
-                return {"code": 1, "msg": "未勾选媒体服务器，请先在设置页勾选服务器并保存"}
-            if not self._servers:
-                logger.warning("【MediaCoverGenerator】立即生成失败：服务器连接信息为空，请检查设置并保存后重试")
-                return {"code": 1, "msg": "服务器连接信息为空，请检查设置并保存后重试"}
-
-            target_style = (style or "").strip()
-            allowed_styles = {
-                "static_1", "static_2", "static_3", "static_4",
-                "animated_1", "animated_2", "animated_3", "animated_4",
-            }
-            if target_style:
-                if target_style not in allowed_styles:
-                    return {"code": 1, "msg": f"不支持的风格: {target_style}"}
-                self._cover_style = target_style
-
-            # 避免重复触发导致卡死：同一时间只允许一个生成任务
-            with self._generate_lock:
-                if self._generate_running:
-                    logger.warning("【MediaCoverGenerator】立即生成失败：已有生成任务正在执行，请等待完成或点击停止任务")
-                    return {"code": 1, "msg": "已有生成任务正在执行，请等待完成或点击停止任务"}
-                self._generate_running = True
-
-            run_style = self._cover_style
-            logger.info(f"【MediaCoverGenerator】收到立即生成请求，风格: {run_style}，已提交后台任务")
-
-            def _worker():
-                # 子线程内独立维护风格，避免与主线程 finally 恢复产生竞争
-                try:
-                    self._cover_style = run_style
-                    self._event.clear()
-                    logger.info("【MediaCoverGenerator】后台封面生成任务开始")
-                    tips = self.__update_all_libraries()
-                    logger.info(f"【MediaCoverGenerator】后台封面生成任务结束：{tips or '已完成'}")
-                except Exception as inner_err:
-                    logger.error(f"【MediaCoverGenerator】后台封面生成失败: {inner_err}", exc_info=True)
-                finally:
-                    self._generate_running = False
-                    self._cover_style = old_style
-
-            threading.Thread(target=_worker, name="MCG-GenerateNow", daemon=True).start()
-            return {"code": 0, "msg": "已开始后台生成封面，请稍后查看日志或历史记录"}
+            self.__update_all_libraries(library_key=library_key)
         except Exception as e:
-            self._generate_running = False
-            logger.error(f"【MediaCoverGenerator】立即生成失败: {e}", exc_info=True)
-            return {"code": 1, "msg": f"封面生成失败: {e}"}
+            logger.error(f"【MediaCoverGenerator】后台生成失败: {e}", exc_info=True)
+        finally:
+            # 任务没能真正开始时才需要复位；这里只认自己的状态，不能覆盖下一个任务
+            if self._task is task:
+                self._task = {"running": False}
 
-    def api_generate_status(self):
-        """查询后台生成任务是否仍在运行"""
-        return {
-            "code": 0,
-            "msg": "running" if self._generate_running else "idle",
-            "data": {"running": self._generate_running, "style": self._cover_style},
-        }
+    def __is_running(self) -> bool:
+        return self._update_lock.locked() or bool(self._task.get("running"))
 
-    def api_set_cover_style(self, style: str = ""):
-        try:
-            target_style = (style or "").strip()
-            allowed_styles = {
-                "static_1", "static_2", "static_3", "static_4",
-                "animated_1", "animated_2", "animated_3", "animated_4",
-            }
-            if target_style not in allowed_styles:
-                return {"code": 1, "msg": f"不支持的风格: {target_style}"}
-            self._cover_style = target_style
-            base, variant = self.__resolve_cover_style_ui(target_style)
-            self._cover_style_base = base
-            self._cover_style_variant = variant
-            self.__update_config()
-            logger.info(f"【MediaCoverGenerator】已保存封面风格: {target_style}")
-            return {"code": 0, "msg": f"已保存风格: {target_style}"}
-        except Exception as e:
-            logger.error(f"【MediaCoverGenerator】保存封面风格失败: {e}", exc_info=True)
-            return {"code": 1, "msg": f"保存风格失败: {e}"}
+    def api_stop_task(self, tab: str = ""):
+        self.__set_page_tab(tab)
+        _, message = self.stop_task()
+        return self.__api_response(True, message)
 
-    def __get_cover_style_parts(self) -> Tuple[str, int]:
-        style = (self._cover_style or "static_1").strip()
-        variant = "animated" if style.startswith("animated_") else "static"
-        try:
-            index = int(style.split("_")[-1])
-        except Exception:
-            index = 1
-        index = max(1, min(4, index))
-        return variant, index
+    def api_refresh(self, tab: str = ""):
+        self.__set_page_tab(tab)
+        self._clean_armed = ""
+        return self.__api_response(True, "")
 
-    def __set_cover_style_parts(self, variant: str, index: int):
-        safe_variant = "animated" if variant == "animated" else "static"
-        safe_index = max(1, min(4, int(index)))
-        target_style = f"{safe_variant}_{safe_index}"
+    def api_history_more(self, tab: str = ""):
+        self.__set_page_tab(tab)
+        self._history_visible += HISTORY_PAGE_SIZE * 2
+        return self.__api_response(True, "")
+
+    def __apply_style(self, target_style: str):
         self._cover_style = target_style
-        self._cover_style_base = f"static_{safe_index}"
-        self._cover_style_variant = safe_variant
+        self._cover_style_base, self._cover_style_variant = self.__resolve_cover_style_ui(target_style)
         self.__update_config()
         logger.info(f"【MediaCoverGenerator】已保存封面风格: {target_style}")
 
-    def api_toggle_style_variant(self):
+    def api_set_cover_style(self, style: str = "", tab: str = ""):
+        self.__set_page_tab(tab)
+        target_style = (style or "").strip()
+        if target_style not in ALL_STYLES:
+            return self.__api_response(False, f"不支持的风格: {target_style}")
         try:
-            variant, index = self.__get_cover_style_parts()
-            new_variant = "animated" if variant == "static" else "static"
-            self.__set_cover_style_parts(new_variant, index)
-            return {"code": 0, "msg": f"已切换为{new_variant}风格{index}"}
+            self.__apply_style(target_style)
+            return self.__api_response(True, f"已保存风格: {target_style}")
         except Exception as e:
-            logger.error(f"【MediaCoverGenerator】切换静态/动态失败: {e}", exc_info=True)
-            return {"code": 1, "msg": f"切换失败: {e}"}
+            logger.error(f"【MediaCoverGenerator】保存封面风格失败: {e}", exc_info=True)
+            return self.__api_response(False, f"保存风格失败: {e}")
 
-    def __api_select_style(self, index: int):
+    def __get_cover_style_parts(self, style: Optional[str] = None) -> Tuple[str, int]:
+        style = (style or self._cover_style or "animated_1").strip()
+        variant = "animated" if style.startswith("animated_") else "static"
         try:
-            variant, _ = self.__get_cover_style_parts()
-            self.__set_cover_style_parts(variant, index)
-            return {"code": 0, "msg": f"已选择{variant}风格{index}"}
+            index = int(style.split("_")[-1])
+        except (TypeError, ValueError):
+            index = 1
+        return variant, max(1, min(STYLE_COUNT, index))
+
+    def __save_target_style(self, library: str, style: str):
+        """library 为空时保存默认风格，否则只保存这个媒体库的风格。"""
+        if library:
+            self.__set_library_style(library, style)
+        else:
+            self.__apply_style(style)
+
+    def api_select_style(self, index: int = 1, tab: str = "", library: str = ""):
+        self.__set_page_tab(tab)
+        try:
+            key = (library or "").strip()
+            self._style_target = key
+            variant, _ = self.__get_cover_style_parts(self.__library_style(key))
+            self.__save_target_style(key, f"{variant}_{max(1, min(STYLE_COUNT, int(index)))}")
+            return self.__api_response(True, "风格已切换")
         except Exception as e:
             logger.error(f"【MediaCoverGenerator】选择风格失败: {e}", exc_info=True)
-            return {"code": 1, "msg": f"选择风格失败: {e}"}
+            return self.__api_response(False, f"选择风格失败: {e}")
 
-    def api_select_style_1(self):
-        return self.__api_select_style(1)
+    def api_set_style_variant(self, variant: str = "animated", tab: str = "", library: str = ""):
+        self.__set_page_tab(tab)
+        try:
+            key = (library or "").strip()
+            self._style_target = key
+            _, index = self.__get_cover_style_parts(self.__library_style(key))
+            safe_variant = "static" if variant == "static" else "animated"
+            self.__save_target_style(key, f"{safe_variant}_{index}")
+            return self.__api_response(True, "已切换")
+        except Exception as e:
+            logger.error(f"【MediaCoverGenerator】切换静态/动态失败: {e}", exc_info=True)
+            return self.__api_response(False, f"切换失败: {e}")
 
-    def api_select_style_2(self):
-        return self.__api_select_style(2)
+    def api_style_target(self, library: str = "", tab: str = ""):
+        self.__set_page_tab(tab)
+        self._style_target = (library or "").strip()
+        return self.__api_response(True, "")
 
-    def api_select_style_3(self):
-        return self.__api_select_style(3)
+    def api_clear_library_style(self, library: str = "", tab: str = ""):
+        self.__set_page_tab(tab)
+        try:
+            self.__set_library_style((library or "").strip(), None)
+            return self.__api_response(True, "已恢复跟随默认风格")
+        except Exception as e:
+            logger.error(f"【MediaCoverGenerator】恢复默认风格失败: {e}", exc_info=True)
+            return self.__api_response(False, f"恢复失败: {e}")
 
-    def api_select_style_4(self):
-        return self.__api_select_style(4)
+    def api_generate_preview(self, library: str = "", tab: str = ""):
+        """用媒体库的真实图片生成 8 款风格的预览。只生成不上传，不会改动媒体库封面。"""
+        self.__set_page_tab(tab)
+        if not self._enabled:
+            return self.__api_response(False, "插件未启用，请先在设置页启用插件并保存")
+        if not self._servers:
+            return self.__api_response(False, "媒体服务器连接信息为空，请检查设置并保存后重试")
+        if self.__is_running():
+            return self.__api_response(False, "已有封面生成任务正在运行")
+        self._event.clear()
+        task = {"running": True, "total": STYLE_COUNT, "done": 0, "current": "准备预览素材"}
+        self._task = task
+        threading.Thread(target=self.__run_preview, args=((library or "").strip(), task),
+                         name="MediaCoverGeneratorPreview", daemon=True).start()
+        return self.__api_response(True, "预览正在后台生成，不会改动媒体库封面")
 
-    def __set_page_tab(self, tab: str):
-        self._page_tab = tab if tab in ["generate-tab", "history-tab", "clean-tab"] else "generate-tab"
-        logger.info(f"【MediaCoverGenerator】已切换页面Tab: {self._page_tab}")
+    def api_clear_preview(self, tab: str = ""):
+        self.__set_page_tab(tab)
+        meta = self.__local_preview_meta()
+        if meta:
+            shutil.rmtree(self.__preview_root() / meta["token"], ignore_errors=True)
+        self.save_data("local_preview", {})
+        return self.__api_response(True, "已恢复示例图")
 
-    def api_set_page_tab_generate(self):
-        self.__set_page_tab("generate-tab")
-        return {"code": 0, "msg": "已切换到封面生成"}
+    def api_local_preview(self, token: str = "", index: int = 0):
+        """返回一张动态预览。路径只由保存的令牌和序号组成，不接受外部传入的路径。"""
+        from fastapi.responses import FileResponse, Response
+        meta = self.__local_preview_meta()
+        if not meta or not hmac.compare_digest(str(token), meta["token"]) or index not in meta["styles"]:
+            return Response(status_code=404)
+        target = self.__preview_root() / meta["token"] / f"style_{index}.gif"
+        if not target.is_file():
+            return Response(status_code=404)
+        return FileResponse(path=str(target), media_type="image/gif", headers={"Cache-Control": "private, max-age=86400"})
 
-    def api_set_page_tab_history(self):
-        self.__set_page_tab("history-tab")
-        return {"code": 0, "msg": "已切换到历史封面"}
+    def __preview_root(self) -> Path:
+        return self.get_data_path() / "preview"
 
-    def api_set_page_tab_clean(self):
-        self.__set_page_tab("clean-tab")
-        return {"code": 0, "msg": "已切换到清理缓存"}
+    def __local_preview_meta(self) -> Optional[Dict[str, Any]]:
+        meta = self.get_data("local_preview")
+        if not isinstance(meta, dict) or not meta.get("token") or not re.fullmatch(r"[\w-]+", str(meta["token"])):
+            return None
+        styles = [int(item) for item in meta.get("styles") or [] if isinstance(item, int) or str(item).isdigit()]
+        if not styles or not (self.__preview_root() / meta["token"]).is_dir():
+            return None
+        return {**meta, "styles": styles}
+
+    def __local_preview_context(self) -> Optional[Dict[str, Any]]:
+        """详情页用的预览信息。静态图内嵌在页面里，动图只放地址。"""
+        meta = self.__local_preview_meta()
+        if not meta:
+            return None
+        folder = self.__preview_root() / meta["token"]
+        styles: Dict[int, Dict[str, Optional[str]]] = {}
+        anonymous = self.__supports_anonymous_route()
+        for index in meta["styles"]:
+            still = self.__thumbnail(folder / f"style_{index}.jpg", (320, 180), 62)
+            if not still:
+                continue
+            has_gif = anonymous and (folder / f"style_{index}.gif").is_file()
+            styles[index] = {
+                "still": still,
+                "gif": f"/api/v1/{self.__api_prefix()}/local_preview?token={meta['token']}&index={index}" if has_gif else None,
+            }
+        if not styles:
+            return None
+        return {"library": meta.get("library") or "", "time": meta.get("time") or "", "styles": styles}
+
+    def __run_preview(self, library_key: str, task: Dict[str, Any]):
+        if not self._update_lock.acquire(blocking=False):
+            if self._task is task:
+                self._task = {"running": False}
+            return
+        folder = None
+        message = ""
+        try:
+            found = self.__find_library(library_key)
+            if not found:
+                message = "预览没有生成：没有找到可用的媒体库"
+                return
+            service, library = found
+            name = library["Name"]
+            self._preview_mode = True
+            try:
+                self.__get_fonts()
+            except Exception as error:
+                logger.warning(f"预览：准备字体失败: {error}")
+            self._preview_stocked = False
+            token = secrets.token_urlsafe(18)
+            folder = self.__preview_root() / token
+            folder.mkdir(parents=True, exist_ok=True)
+            done: List[int] = []
+            for index in range(1, STYLE_COUNT + 1):
+                if self._event.is_set():
+                    break
+                self._run_style = f"animated_{index}"
+                task["current"] = f"预览 {name}：{style_info(index).name}"
+                self._failure_reason = ""
+                try:
+                    image_data = self.__build_library_image(service, library)
+                    if image_data and self.__store_preview(folder, index, image_data):
+                        done.append(index)
+                    else:
+                        logger.warning(f"预览：{style_info(index).name} 没有生成：{self._failure_reason}")
+                except Exception as error:
+                    logger.error(f"预览：{style_info(index).name} 生成失败: {error}", exc_info=True)
+                task["done"] = index
+            if not done:
+                shutil.rmtree(folder, ignore_errors=True)
+                message = "预览已停止" if self._event.is_set() else f"预览没有生成：{self._failure_reason or '媒体库里没有可用的图片'}"
+                return
+            previous = self.__local_preview_meta()
+            self.save_data("local_preview", {
+                "token": token, "library": name, "key": library_key,
+                "time": datetime.datetime.now().strftime("%m-%d %H:%M"), "styles": done,
+            })
+            if previous and previous["token"] != token:
+                shutil.rmtree(self.__preview_root() / previous["token"], ignore_errors=True)
+            message = f"预览已生成：用「{name}」生成了 {len(done)} 款，媒体库封面没有改动"
+            logger.info(message)
+        except Exception as error:
+            logger.error(f"生成预览失败: {error}", exc_info=True)
+            message = f"预览生成失败: {error}"
+            if folder:
+                shutil.rmtree(folder, ignore_errors=True)
+        finally:
+            self._preview_mode = False
+            self._preview_stocked = False
+            self._run_style = None
+            self._current_updating_items.clear()
+            self._event.clear()
+            self._task = {"running": False}
+            if message:
+                try:
+                    self.save_data("last_run", {"time": datetime.datetime.now().strftime("%m-%d %H:%M"), "message": message})
+                except Exception as error:
+                    logger.debug(f"记录预览结果失败: {error}")
+            self._update_lock.release()
+
+    def __find_library(self, library_key: str):
+        """按键找到媒体库；没有指定时取第一个参与批量更新的媒体库。"""
+        fallback = None
+        for server, service in (self._servers or {}).items():
+            for library in self.__get_server_libraries(service) or []:
+                library_id = library.get("Id") if service.type == "emby" else library.get("ItemId")
+                key = f"{server}-{library_id}"
+                if library_key and key == library_key:
+                    return service, library
+                if not fallback and self.__in_batch(key, library.get("CollectionType")):
+                    fallback = (service, library)
+        return None if library_key else fallback
+
+    @staticmethod
+    def __store_preview(folder: Path, index: int, image_base64: str) -> bool:
+        raw = base64.b64decode(image_base64)
+        with Image.open(BytesIO(raw)) as image:
+            still = image.convert("RGB")
+            still.thumbnail((480, 270))
+            still.save(folder / f"style_{index}.jpg", quality=86)
+        if raw[:3] == b"GIF":
+            (folder / f"style_{index}.gif").write_bytes(raw)
+        return True
 
     def api_saved_cover_image(self, file: str = ""):
         target_file = self.__resolve_saved_cover_path(file)
-        if not target_file or not target_file.exists() or not target_file.is_file():
-            return {"code": 1, "msg": "图片不存在"}
+        if not target_file:
+            return self.__api_response(False, "图片不存在")
         mime_type, _ = mimetypes.guess_type(str(target_file))
         if not mime_type:
             mime_type = "image/jpeg"
-        try:
-            from fastapi.responses import FileResponse
-            return FileResponse(path=str(target_file), media_type=mime_type)
-        except Exception:
-            try:
-                from starlette.responses import FileResponse
-                return FileResponse(path=str(target_file), media_type=mime_type)
-            except Exception as e:
-                logger.error(f"【MediaCoverGenerator】返回图片失败: {e}")
-                return {"code": 1, "msg": "返回图片失败"}
+        from fastapi.responses import FileResponse
+        return FileResponse(path=str(target_file), media_type=mime_type)
 
     def get_service(self) -> List[Dict[str, Any]]:
         """
@@ -933,14 +1232,19 @@ class MediaCoverGenerator(_PluginBase):
         """
         services = []
         if self._enabled and self._cron:
-            services.append({
-                "id": "MediaCoverGenerator",
-                "name": "媒体库封面更新服务",
-                "trigger": CronTrigger.from_crontab(self._cron),
-                "func": self.__update_all_libraries,
-                "kwargs": {}
-            })
-        
+            try:
+                trigger = CronTrigger.from_crontab(self._cron)
+            except (TypeError, ValueError) as error:
+                logger.error(f"定时更新封面 Cron 配置无效: {error}")
+            else:
+                services.append({
+                    "id": "MediaCoverGenerator",
+                    "name": "媒体库封面更新服务",
+                    "trigger": trigger,
+                    "func": self.__scheduled_update,
+                    "kwargs": {}
+                })
+
         # 总是显示停止按钮，以便中断长时间运行的任务
         services.append({
             "id": "StopMediaCoverGenerator",
@@ -951,1800 +1255,326 @@ class MediaCoverGenerator(_PluginBase):
         })
         return services
 
+    def __scheduled_update(self):
+        """
+        定时任务的入口。开启轮换时先把默认风格换成下一款，所有媒体库仍然统一；
+        改的是默认风格，所以入库更新也会跟上，单独设置过风格的媒体库不受影响。
+        """
+        if self._rotate_style and not self.__is_running():
+            variant, index = self.__get_cover_style_parts()
+            self.__apply_style(f"{variant}_{index % STYLE_COUNT + 1}")
+            logger.info(f"定时轮换风格：这次使用「{style_info(index % STYLE_COUNT + 1).name}」")
+        return self.__update_all_libraries()
+
     def stop_task(self):
         """
         手动停止当前正在执行的任务
         """
+        if not self.__is_running():
+            return True, "当前没有正在执行的封面更新任务"
         if not self._event.is_set():
             logger.info("正在发送停止任务信号...")
             self._event.set()
-            return True, "已发送停止停止信号，请等待当前操作清理完成"
-        return True, "任务已处于停止状态或正在停止中"
+            return True, "已发送停止信号，请等待当前操作清理完成"
+        return True, "任务正在停止中"
+
+    def __server_configs(self) -> List[Any]:
+        try:
+            return [config for config in self.mediaserver_helper.get_configs().values()
+                    if config.type in ("emby", "jellyfin")]
+        except Exception as error:
+            logger.warning(f"读取媒体服务器配置失败: {error}")
+            return []
+
+    def __libraries_for_form(self) -> List[Dict[str, str]]:
+        """列出所有已配置服务器的媒体库，这样勾选新服务器后无需先保存就能选媒体库。"""
+        result: List[Dict[str, str]] = []
+        now = time.time()
+        for config in self.__server_configs():
+            name = config.name
+            cached = self._library_cache.get(name)
+            if cached and now - cached[0] < LIBRARY_CACHE_SECONDS:
+                result.extend(cached[1])
+                continue
+            libraries: List[Dict[str, str]] = []
+            try:
+                services = self.mediaserver_helper.get_services(name_filters=[name]) or {}
+                service = services.get(name)
+                if service and not service.instance.is_inactive():
+                    libraries = self.__get_all_libraries(name, service)
+            except Exception as error:
+                logger.warning(f"读取媒体服务器 {name} 的媒体库失败: {error}")
+            self._library_cache[name] = (now, libraries)
+            result.extend(libraries)
+        return result
+
+    def __title_config_from_libraries(self, libraries: List[Dict[str, str]]) -> str:
+        """在现有标题配置后补上尚未配置的媒体库，已有内容保持不变。"""
+        existing_text = (self._title_config or "").rstrip()
+        configured = set(self.__load_title_config(existing_text)) if existing_text else set()
+        blocks = [existing_text] if existing_text else []
+        seen = set()
+        for library in libraries:
+            name = library.get("library") or library.get("name") or ""
+            if not name or name in configured or name in seen:
+                continue
+            seen.add(name)
+            quoted_name = json.dumps(name, ensure_ascii=False)
+            blocks.append(f'{quoted_name}:\n  - {quoted_name}\n  - ""')
+        return "\n".join(blocks) + "\n" if blocks else ""
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         """
         拼装插件配置页面
         """
-        # 每次用户打开插件设置页面时，强制重置回封面生成页签，满足不记忆页签的需求
-        self._page_tab = "generate-tab"
-        
+        self._page_tab = "style"
+        self._style_target = ""
+        self._history_visible = HISTORY_PAGE_SIZE
+        self._clean_armed = ""
         zh_font_items, en_font_items, _, _ = self.__get_font_presets()
-        # 标题配置
-        title_tab = [
-            {
-                'component': 'VRow',
-                'content': [
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                        },
-                        'content': [
-                            {
-                                'component': 'VAceEditor',
-                                'props': {
-                                    'modelvalue': 'title_config',
-                                    'lang': 'yaml',
-                                    'theme': 'monokai',
-                                    'style': 'height: 30rem',
-                                    'label': '中英标题配置',
-                                    'placeholder': '''媒体库名称:
-- 主标题
-- 副标题
-- "#FF5722"  # 可选：背景颜色（必须加引号）'''
-                                 }
-                             }
-                         ]
-                     },
-                ]
-            },
+        libraries = self.__libraries_for_form()
+        library_items = [
+            {"title": library["name"], "value": library["value"], "server": library["server"]}
+            for library in libraries
         ]
-
-        # 其他设置标签
-        others_tab = [
-            
-            {
-                'component': 'VRow',
-                'content': [
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                        },
-                        'content': [
-                            {
-                                'component': 'VAlert',
-                                'props': {
-                                    'type': 'info',
-                                    'variant': 'tonal',
-                                    'text': '自定义图片目录：请将图片存于与媒体库同名的子目录下，例如：/mnt/custom_images/华语电影/1.jpg，填写 /mnt/custom_images 即可。多图模式下，文件名须为 1.jpg, 2.jpg, ...9.jpg，不满足的会被重命名，不够的会随机复制填满9张'
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 4
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'covers_input',
-                                    'label': '自定义图片目录（可选）',
-                                    'prependInnerIcon': 'mdi-file-image',
-                                    'hint': '使用你指定的图片生成封面，图片放在与媒体库同名的文件夹下',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 4
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'covers_output',
-                                    'label': '历史封面保存目录（可选）',
-                                    'prependInnerIcon': 'mdi-file-image',
-                                    'hint': '生成的封面默认保存在本插件数据目录下',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                                        {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 4
-                        },
-                        'content': [
-                            {
-                                'component': 'VSwitch',
-                                'props': {
-                                    'model': 'save_recent_covers',
-                                    'label': '保存最近生成的封面',
-                                    'hint': '默认开启，保存历史封面',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 4
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'covers_history_limit_per_library',
-                                    'label': '媒体库历史封面数量',
-                                    'prependInnerIcon': 'mdi-history',
-                                    'hint': '单个媒体库封面保留上限，默认 10',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 4
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'covers_page_history_limit',
-                                    'label': '历史封面显示数量',
-                                    'prependInnerIcon': 'mdi-image-multiple-outline',
-                                    'hint': '历史封面「显示数量」，默认 50',
-                                    'persistentHint': True
-                                },
-                            }
-                        ]
-                    }
-                ]
-            },
-            
-        ]
-        # 更多参数标签
-        single_tab = [
-            {
-                'component': 'VRow',
-                'content': [
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                        },
-                        'content': [
-                            {
-                                'component': 'VAlert',
-                                'props': {
-                                    'type': 'info',
-                                    'variant': 'tonal',
-                                    'text': '字体设置为可选项。若字体无法下载，可以手动下载并填写本地路径。主标题和副标题可以使用不同的字体。'
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 6
-                        },
-                        'content': [
-                            {
-                                'component': 'VSelect',
-                                'props': {
-                                    'chips': False,
-                                    'multiple': False,
-                                    'model': 'zh_font_preset',
-                                    'label': '主标题字体预设',
-                                    'prependInnerIcon': 'mdi-ideogram-cjk',
-                                    'items': zh_font_items
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 6
-                        },
-                        'content': [
-                            {
-                                'component': 'VSelect',
-                                'props': {
-                                    'chips': False,
-                                    'multiple': False,
-                                    'model': 'en_font_preset',
-                                    'label': '副标题字体预设',
-                                    'prependInnerIcon': 'mdi-format-font',
-                                    'items': en_font_items
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 6
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'zh_font_custom',
-                                    'label': '自定义主标题字体',
-                                    'prependInnerIcon': 'mdi-ideogram-cjk',
-                                    'placeholder': '留空使用预设字体',
-                                    'hint': '字体链接 / 路径',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 6
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'en_font_custom',
-                                    'label': '自定义副标题字体',
-                                    'prependInnerIcon': 'mdi-format-font',
-                                    'placeholder': '留空使用预设字体',
-                                    'hint': '字体链接 / 路径',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 6
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'zh_font_size',
-                                    'label': '主标题字体大小',
-                                    'prependInnerIcon': 'mdi-format-size',
-                                    'placeholder': '留空使用预设尺寸',
-                                    'hint': '根据自己喜好设置，默认 180',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 6
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'en_font_size',
-                                    'label': '副标题字体大小',
-                                    'prependInnerIcon': 'mdi-format-size',
-                                    'placeholder': '留空使用预设尺寸',
-                                    'hint': '根据自己喜好设置，默认 75',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 6
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'blur_size',
-                                    'label': '背景模糊尺寸',
-                                    'prependInnerIcon': 'mdi-blur',
-                                    'placeholder': '留空使用预设尺寸',
-                                    'hint': '数字越大越模糊，默认 50',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 6
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'color_ratio',
-                                    'label': '背景颜色混合占比',
-                                    'prependInnerIcon': 'mdi-format-color-fill',
-                                    'placeholder': '留空使用预设占比',
-                                    'hint': '颜色所占的比例，0-1，默认 0.8',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 6
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'title_scale',
-                                    'label': '标题整体缩放',
-                                    'prependInnerIcon': 'mdi-arrow-expand-all',
-                                    'placeholder': '留空使用预设比例',
-                                    'hint': '以 1080p 为基准，1.0 为默认',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 4
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'zh_font_offset',
-                                    'label': '主标题偏移量',
-                                    'prependInnerIcon': 'mdi-arrow-up-down',
-                                    'placeholder': '留空使用预设尺寸',
-                                    'hint': '上移为负值，下移为正值',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 4
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'title_spacing',
-                                    'label': '主副标题间距',
-                                    'prependInnerIcon': 'mdi-arrow-up-down',
-                                    'placeholder': '留空使用预设尺寸',
-                                    'hint': '大于 0，默认 40',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VCol',
-                        'props': {
-                            'cols': 12,
-                            'md': 4
-                        },
-                        'content': [
-                            {
-                                'component': 'VTextField',
-                                'props': {
-                                    'model': 'en_line_spacing',
-                                    'label': '副标题行间距',
-                                    'prependInnerIcon': 'mdi-format-line-height',
-                                    'placeholder': '留空使用预设尺寸',
-                                    'hint': '大于 0，默认 40',
-                                    'persistentHint': True
-                                }
-                            }
-                        ]
-                    },
-                ]
-            },
-        ]
-
-        more_tab = single_tab + others_tab
-
-        styles = [
-            {
-                "value": "static_1",
-                "src": self.__style_preview_src(1)
-            },
-            {
-                "value": "static_2",
-                "src": self.__style_preview_src(2)
-            },
-            {
-                "value": "static_3",
-                "src": self.__style_preview_src(3)
-            },
-            {
-                "value": "static_4",
-                "src": self.__style_preview_src(4)
-            }
-        ]
-
-        style_variant_items = [
-            {
-                'component': 'VBtn',
-                'props': {
-                    'value': 'static',
-                    'variant': 'outlined',
-                    'color': 'primary',
-                    'prependIcon': 'mdi-image-outline',
-                    'class': 'text-none',
-                },
-                'text': '静态'
-            },
-            {
-                'component': 'VBtn',
-                'props': {
-                    'value': 'animated',
-                    'variant': 'outlined',
-                    'color': 'primary',
-                    'prependIcon': 'mdi-play-box-multiple-outline',
-                    'class': 'text-none',
-                },
-                'text': '动态'
-            }
-        ]
-
-        preview_style_content = []
-
-        for style in styles:
-            preview_style_content.append(
-                {
-                    'component': 'VCol',
-                    'props': {
-                        'cols': 12,
-                        'md': 3,
-                    },
-                    'content': [
-                        {
-                            'component': 'VLabel',
-                            'props': {
-                                'class': 'd-block w-100 cursor-pointer'
-                            },
-                            'content': [
-                                {
-                                    'component': 'VCard',
-                                    'props': {
-                                        'variant': 'flat',
-                                        'class': 'rounded-lg overflow-hidden',
-                                        'style': f'position: relative; background-image: linear-gradient(rgba(80,80,80,0.25), rgba(80,80,80,0.25)), url({style.get("src")}); background-size: cover; background-position: center; background-repeat: no-repeat;'
-                                    },
-                                    'content': [
-                                        {
-                                            'component': 'VImg',
-                                            'props': {
-                                                'src': style.get('src'),
-                                                'aspect-ratio': '16/9',
-                                                'cover': True,
-                                            }
-                                        },
-                                        {
-                                            'component': 'VRadio',
-                                            'props': {
-                                                'value': style.get('value'),
-                                                'color': '#FFFFFF',
-                                                'baseColor': '#FFFFFF',
-                                                'density': 'default',
-                                                'hideDetails': True,
-                                                'class': 'position-absolute',
-                                                'style': 'top: 8px; right: 8px; z-index: 2; margin: 0; transform: scale(1.2); transform-origin: top right;'
-                                            }
-                                        }
-                                    ]
-                                }
-                            ]
-                        }
-                    ]
-                }
-            )
-
-        # 封面风格设置标签
-        style_tab = [
-            {
-                'component': 'VAlert',
-                'props': {
-                    'type': 'info',
-                    'variant': 'tonal',
-                    'text': '先选基础样式，再选静态或动态。点击整张预览图即可切换。',
-                    'class': 'mb-3'
-                }
-            },
-            {
-                'component': 'VRadioGroup',
-                'props': {
-                    'model': 'cover_style_base',
-                },
-                'content': [
-                    {
-                        'component': 'VRow',
-                        'content': preview_style_content
-                    }
-                ]
-            },
-            {
-                'component': 'VBtnToggle',
-                'props': {
-                    'model': 'cover_style_variant',
-                    'mandatory': True,
-                    'class': 'mt-3',
-                    'divided': True
-                },
-                'content': style_variant_items
-            },
-            {
-                'component': 'VExpansionPanels',
-                'props': {
-                    'multiple': True,
-                    'class': 'mt-3'
-                },
-                'content': [
-                    {
-                        'component': 'VExpansionPanel',
-                        'props': {
-                            'elevation': 0,
-                            'class': 'rounded-lg',
-                            'style': 'background-color: rgba(var(--v-theme-surface), 0.38); border: 1px solid rgba(var(--v-border-color), 0.35); backdrop-filter: blur(6px);'
-                        },
-                        'content': [
-                            {
-                                'component': 'VExpansionPanelTitle',
-                                'props': {
-                                    'class': 'font-weight-medium'
-                                },
-                                'text': '基本参数'
-                            },
-                            {
-                                'component': 'VExpansionPanelText',
-                                'content': [
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VBtnToggle',
-                                                        'props': {
-                                                            'model': 'use_primary',
-                                                            'mandatory': True,
-                                                            'divided': True,
-                                                            'class': 'w-100'
-                                                        },
-                                                        'content': [
-                                                            {
-                                                                'component': 'VBtn',
-                                                                'props': {
-                                                                    'value': True,
-                                                                    'variant': 'outlined',
-                                                                    'color': 'primary',
-                                                                    'class': 'text-none'
-                                                                },
-                                                                'text': '海报图'
-                                                            },
-                                                            {
-                                                                'component': 'VBtn',
-                                                                'props': {
-                                                                    'value': False,
-                                                                    'variant': 'outlined',
-                                                                    'color': 'primary',
-                                                                    'class': 'text-none'
-                                                                },
-                                                                'text': '背景图'
-                                                            }
-                                                        ]
-                                                    },
-                                                    {
-                                                        'component': 'VLabel',
-                                                        'props': {
-                                                            'class': 'text-caption text-medium-emphasis mt-1 d-inline-block'
-                                                        }
-                                                        ,
-                                                        'text': '选图优先来源'
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VBtnToggle',
-                                                        'props': {
-                                                            'model': 'multi_1_blur',
-                                                            'mandatory': True,
-                                                            'divided': True,
-                                                            'class': 'w-100'
-                                                        },
-                                                        'content': [
-                                                            {
-                                                                'component': 'VBtn',
-                                                                'props': {
-                                                                    'value': True,
-                                                                    'variant': 'outlined',
-                                                                    'color': 'primary',
-                                                                    'class': 'text-none'
-                                                                },
-                                                                'text': '模糊背景'
-                                                            },
-                                                            {
-                                                                'component': 'VBtn',
-                                                                'props': {
-                                                                    'value': False,
-                                                                    'variant': 'outlined',
-                                                                    'color': 'primary',
-                                                                    'class': 'text-none'
-                                                                },
-                                                                'text': '纯色渐变'
-                                                            }
-                                                        ]
-                                                    },
-                                                    {
-                                                        'component': 'VLabel',
-                                                        'props': {
-                                                            'class': 'text-caption text-medium-emphasis mt-1 d-inline-block'
-                                                        }
-                                                        ,
-                                                        'text': '针对九宫格海报'
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSelect',
-                                                        'props': {
-                                                            'chips': False,
-                                                            'multiple': False,
-                                                            'model': 'resolution',
-                                                            'label': '静态分辨率',
-                                                            'prependInnerIcon': 'mdi-monitor-screenshot',
-                                                            'items': [
-                                                                {'title': '1080p (1920x1080)', 'value': '1080p'},
-                                                                {'title': '720p (1280x720)', 'value': '720p'},
-                                                                {'title': '480p (854x480)', 'value': '480p'}
-                                                            ],
-                                                            'hint': '动态分辨率默认320*180',
-                                                            'persistentHint': True
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VExpansionPanels',
-                                        'props': {
-                                            'multiple': True,
-                                            'class': 'mt-2'
-                                        },
-                                        'content': [
-                                            {
-                                                'component': 'VExpansionPanel',
-                                                'props': {
-                                                    'elevation': 0,
-                                                    'class': 'rounded-lg',
-                                                    'style': 'background-color: rgba(255,255,255,0.55); border: 1px dashed rgba(0,0,0,0.18);'
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'VExpansionPanelTitle',
-                                                        'text': '背景颜色设置（全部风格生效）'
-                                                    },
-                                                    {
-                                                        'component': 'VExpansionPanelText',
-                                                        'content': [
-                                                            {
-                                                                'component': 'VRow',
-                                                                'content': [
-                                                                    {
-                                                                        'component': 'VCol',
-                                                                        'props': {'cols': 12, 'md': 4},
-                                                                        'content': [
-                                                                            {
-                                                                                'component': 'VSelect',
-                                                                                'props': {
-                                                                                    'model': 'bg_color_mode',
-                                                                                    'label': '背景颜色来源',
-                                                                                    'prependInnerIcon': 'mdi-palette',
-                                                                                    'items': [
-                                                                                        {'title': '自动从图片提取', 'value': 'auto'},
-                                                                                        {'title': '自定义（全局统一）', 'value': 'custom'},
-                                                                                        {'title': '从配置获取', 'value': 'config'}
-                                                                                    ]
-                                                                                }
-                                                                            }
-                                                                        ]
-                                                                    },
-                                                                    {
-                                                                        'component': 'VCol',
-                                                                        'props': {'cols': 12, 'md': 8},
-                                                                        'content': [
-                                                                            {
-                                                                                'component': 'VTextField',
-                                                                                'props': {
-                                                                                    'model': 'custom_bg_color',
-                                                                                    'label': '自定义背景色',
-                                                                                    'prependInnerIcon': 'mdi-eyedropper',
-                                                                                    'placeholder': '#FF5722',
-                                                                                    'hint': '支持 #十六进制、rgb(...)、颜色英文名',
-                                                                                    'persistentHint': True
-                                                                                }
-                                                                            },
-                                                                            {
-                                                                                'component': 'VColorPicker',
-                                                                                'props': {
-                                                                                    'model': 'custom_bg_color',
-                                                                                    'mode': 'hexa',
-                                                                                    'showSwatches': True,
-                                                                                    'hideCanvas': False,
-                                                                                    'hideInputs': True,
-                                                                                    'elevation': 0,
-                                                                                    'class': 'mt-2'
-                                                                                }
-                                                                            }
-                                                                        ]
-                                                                    }
-                                                                ]
-                                                            }
-                                                        ]
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    }
-                                ]
-                            }
-                        ]
-                    },
-                    {
-                        'component': 'VExpansionPanel',
-                        'props': {
-                            'elevation': 0,
-                            'class': 'rounded-lg',
-                            'style': 'background-color: rgba(var(--v-theme-surface), 0.32); border: 1px solid rgba(var(--v-border-color), 0.32); backdrop-filter: blur(6px);'
-                        },
-                        'content': [
-                            {
-                                'component': 'VExpansionPanelTitle',
-                                'props': {
-                                    'class': 'font-weight-medium'
-                                },
-                                'text': '动态图参数'
-                            },
-                            {
-                                'component': 'VExpansionPanelText',
-                                'content': [
-                                    {
-                                        'component': 'VRow',
-                                        'props': {'class': 'mt-1'},
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'animation_duration',
-                                                            'label': '动画循环周期 (秒)',
-                                                            'type': 'number',
-                                                            'prependInnerIcon': 'mdi-clock-outline'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'animation_fps',
-                                                            'label': '帧率 (FPS)',
-                                                            'type': 'number',
-                                                            'prependInnerIcon': 'mdi-speedometer'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSelect',
-                                                        'props': {
-                                                            'model': 'animation_format',
-                                                            'label': '输出格式',
-                                                            'items': [
-                                                                {'title': 'APNG', 'value': 'apng'},
-                                                                {'title': 'GIF', 'value': 'gif'}
-                                                            ],
-                                                            'prependInnerIcon': 'mdi-file-video'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 3},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSelect',
-                                                        'props': {
-                                                            'model': 'animation_reduce_colors',
-                                                            'label': '颜色压缩等级',
-                                                            'items': [
-                                                                {'title': '关闭（保真优先）', 'value': 'off'},
-                                                                {'title': '中等压缩', 'value': 'medium'},
-                                                                {'title': '强压缩（体积最小）', 'value': 'strong'}
-                                                            ],
-                                                            'prependInnerIcon': 'mdi-palette-outline'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'props': {'class': 'mt-2'},
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'animated_2_image_count',
-                                                            'label': '样式1/2 图片数量 (3~9)',
-                                                            'type': 'number',
-                                                            'min': 3,
-                                                            'max': 9,
-                                                            'hint': '仅样式1/2有效',
-                                                            'persistentHint': True,
-                                                            'prependInnerIcon': 'mdi-image-multiple'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSelect',
-                                                        'props': {
-                                                            'model': 'animated_2_departure_type',
-                                                            'label': '样式1动画风格',
-                                                            'hint': '仅样式1有效',
-                                                            'persistentHint': True,
-                                                            'items': [
-                                                                {'title': '旋转-飞出', 'value': 'fly'},
-                                                                {'title': '旋转-渐隐', 'value': 'fade'},
-                                                                {'title': '渐变', 'value': 'crossfade'}
-                                                            ],
-                                                            'prependInnerIcon': 'mdi-transition'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {'cols': 12, 'md': 4},
-                                                'content': [
-                                                    {
-                                                        'component': 'VSelect',
-                                                        'props': {
-                                                            'model': 'animation_scroll',
-                                                            'label': '样式3滚动方向',
-                                                            'hint': '仅样式3有效',
-                                                            'persistentHint': True,
-                                                            'items': [
-                                                                {'title': '向下', 'value': 'down'},
-                                                                {'title': '向上', 'value': 'up'},
-                                                                {'title': '交替 (两边下/中间上)', 'value': 'alternate'},
-                                                                {'title': '交替反向 (两边上/中间下)', 'value': 'alternate_reverse'}
-                                                            ],
-                                                            'prependInnerIcon': 'mdi-swap-vertical'
-                                                        }
-                                                    }
-                                                ]
-                                            }
-                                        ]
-                                    },
- 
-                                ]
-                            }
-                        ]
-                    }
-                ]
-            }
-        ]
-
-
-        return [
-            {
-                "component": "VCard",
-                "props": {"variant": "outlined", "class": "mb-3"},
-                "content": [
-                    {
-                        "component": "VCardTitle",
-                        "props": {"class": "d-flex align-center"},
-                        "content": [
-                            {
-                                "component": "VIcon",
-                                "props": {
-                                    "icon": "mdi-cog",
-                                    "color": "primary",
-                                    "class": "mr-2",
-                                },
-                            },
-                            {"component": "span", "text": "基础设置"},
-                        ],
-                    },
-                    {"component": "VDivider"},
-                    {
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                'component': 'VForm',
-                                'content': [
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                    'md': 3
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'VSwitch',
-                                                        'props': {
-                                                            'model': 'enabled',
-                                                            'label': '启用插件',
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                    'md': 3
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'VSwitch',
-                                                        'props': {
-                                                            'model': 'update_now',
-                                                            'label': '立即更新封面',
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                    'md': 3
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'VSwitch',
-                                                        'props': {
-                                                            'model': 'transfer_monitor',
-                                                            'label': '入库监控',
-                                                            'hint': '自动更新入库媒体所在媒体库封面',
-                                                            'persistentHint': True
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                    'md': 3
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'delay',
-                                                            'label': '入库延迟（秒）',
-                                                            'placeholder': '60',
-                                                            'hint': '根据实际情况调整延迟时间',
-                                                            'persistentHint': True
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                    'md': 3
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'VTextField',
-                                                        'props': {
-                                                            'model': 'request_timeout',
-                                                            'label': '接口超时（秒）',
-                                                            'placeholder': '30',
-                                                            'hint': '单个媒体库查询超时时间，媒体库过大时可适当调大，防止卡死',
-                                                            'persistentHint': True
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                    'md': 6
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'VSelect',
-                                                        'props': {
-                                                            'multiple': True,
-                                                            'chips': True,
-                                                            'clearable': True,
-                                                            'model': 'selected_servers',
-                                                            'label': '媒体服务器',
-                                                            'items': [{"title": config.name, "value": config.name}
-                                                                    for config in self.mediaserver_helper.get_configs().values()
-                                                                    if config.type in ("emby", "jellyfin")
-                                                                    ]
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                    'md': 3
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'VSelect',
-                                                        'props': {
-                                                            'chips': False,
-                                                            'multiple': False,
-                                                            'model': 'sort_by',
-                                                            'label': '封面来源排序，默认随机',
-                                                            'items': [
-                                                                {"title": "随机", "value": "Random"},
-                                                                {"title": "最新入库", "value": "DateCreated"},
-                                                                {"title": "最新发行", "value": "PremiereDate"}
-                                                                ]
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                    'md': 3
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'VCronField',
-                                                        'props': {
-                                                            'model': 'cron',
-                                                            'label': '定时更新封面',
-                                                            'placeholder': '5位cron表达式'
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                            
-                                        ]
-                                    },
-                                    {
-                                        'component': 'VRow',
-                                        'content': [
-                                            {
-                                                'component': 'VCol',
-                                                'props': {
-                                                    'cols': 12,
-                                                },
-                                                'content': [
-                                                    {
-                                                        'component': 'VSelect',
-                                                        'props': {
-                                                            'multiple': True,
-                                                            'chips': True,
-                                                            'clearable': True,
-                                                            'model': 'include_libraries',
-                                                            'label': '更新媒体库',
-                                                            'items': [
-                                                                {"title": config['name'], "value": config['value']}
-                                                                    for config in self._all_libraries
-                                                            ],
-                                                            'hint': '默认更新全部，或只更新勾选的媒体库',
-                                                            'persistentHint': True
-                                                        }
-                                                    }
-                                                ]
-                                            },
-                                        ]
-                                    }
-                                    
-                                ]
-                            },
-                        ]
-                    }
-                ]
-            },
-            {
-                "component": "VCard",
-                "props": {"variant": "outlined"},
-                "content": [
-                    {
-                        "component": "VTabs",
-                        "props": {"model": "tab", "grow": True, "color": "primary"},
-                        "content": [
-                            {
-                                "component": "VTab",
-                                "props": {"value": "style-tab"},
-                                "content": [
-                                    {
-                                        "component": "VIcon",
-                                        "props": {
-                                            "icon": "mdi-palette-swatch",
-                                            "start": True,
-                                            "color": "#cc76d1",
-                                        },
-                                    },
-                                    {"component": "span", "text": "封面风格"},
-                                ],
-                            },
-                            {
-                                "component": "VTab",
-                                "props": {"value": "title-tab"},
-                                "content": [
-                                    {
-                                        "component": "VIcon",
-                                        "props": {
-                                            "icon": "mdi-text-box-edit",
-                                            "start": True,
-                                            "color": "#1976D2",
-                                        },
-                                    },
-                                    {"component": "span", "text": "封面标题"},
-                                ],
-                            },
-                            {
-                                "component": "VTab",
-                                "props": {"value": "more-tab"},
-                                "content": [
-                                    {
-                                        "component": "VIcon",
-                                        "props": {
-                                            "icon": "mdi-palette-swatch-variant",
-                                            "start": True,
-                                            "color": "#f3afe4",
-                                        },
-                                    },
-                                    {"component": "span", "text": "更多参数"},
-                                ],
-                            },
-                        ],
-                    },
-                    {"component": "VDivider"},
-                    {
-                        "component": "VWindow",
-                        "props": {"model": "tab"},
-                        "content": [
-                            {
-                                "component": "VWindowItem",
-                                "props": {"value": "style-tab"},
-                                "content": [
-                                    {"component": "VCardText", "content": style_tab}
-                                ],
-                            },
-                            {
-                                "component": "VWindowItem",
-                                "props": {"value": "title-tab"},
-                                "content": [
-                                    {
-                                        "component": "VCardText",
-                                        "content": title_tab,
-                                    }
-                                ],
-                            },
-                            {
-                                "component": "VWindowItem",
-                                "props": {"value": "more-tab"},
-                                "content": [
-                                    {"component": "VCardText", "content": more_tab}
-                                ],
-                            }
-                        ],
-                    },
-                ],
-            }
-        ], {
-            "enabled": True,
-            "update_now": False,
-            "transfer_monitor": True,
-            "cron": "",
-            "delay": 60,
-            "request_timeout": 30,
-            "selected_servers": [],
-            "include_libraries": [],
-            "sort_by": "Random",
-            "title_config": '''# 配置封面标题（按媒体库名称对应）
-# 支持两种格式：
-#
-# 格式1 - 两行配置（主标题+副标题）：
-# 媒体库名称:
-#   - 主标题
-#   - 副标题
-#
-# 格式2 - 三行配置（主标题+副标题+背景颜色）：
-# 媒体库名称:
-#   - 主标题
-#   - 副标题
-#   - "#FF5722"  # 背景颜色（可选，必须加引号）
-#
-''',
-            "tab": "style-tab",
-            "cover_style": "static_1",
-            "cover_style_base": "static_1",
-            "cover_style_variant": "static",
-            "multi_1_blur": True,
-            "zh_font_preset": "chaohei",
-            "en_font_preset": "EmblemaOne",
-            "zh_font_custom": "",
-            "en_font_custom": "",
-            "zh_font_size": None,
-            "en_font_size": None,
-            "blur_size": 50,
-            "color_ratio": 0.8,
-            "title_scale": 1.0,
-            "use_primary": False,
-            "resolution": "480p",
-            "custom_width": 1920,
-            "custom_height": 1080,
-            "bg_color_mode": "auto",
-            "custom_bg_color": "",
-            "animation_duration": 8,
-            "animation_scroll": "alternate",
-            "animation_fps": 24,
-            "animation_format": "apng",
-            "animation_resolution": "320x180",
-            "animation_reduce_colors": "medium",
-            "animated_2_image_count": 6,
-            "animated_2_departure_type": "fly",
-            "clean_images": False,
-            "clean_fonts": False,
-            "save_recent_covers": True,
-            "covers_history_limit_per_library": 10,
-            "covers_page_history_limit": 50,
-            "page_tab": "generate-tab",
-            "style_naming_v2": True,
+        ctx = {
+            "server_items": [{"title": config.name, "value": config.name} for config in self.__server_configs()],
+            # 媒体库选项跟随已选服务器变化，表达式在前端按当前表单值计算
+            "library_items_expr": "{{ %s.filter(item => (selected_servers || []).includes(item.server)) }}"
+                                  % json.dumps(library_items, ensure_ascii=False),
+            "title_from_libraries": self.__title_config_from_libraries(libraries),
+            "zh_font_items": zh_font_items,
+            "en_font_items": en_font_items,
         }
+        return build_form(ctx), default_form_model()
+
+    def __run_summary(self) -> Tuple[str, str]:
+        last_run = self.get_data("last_run") or {}
+        if not isinstance(last_run, dict) or not last_run.get("time"):
+            return "", ""
+        return str(last_run.get("time")), str(last_run.get("message") or "")
+
+    def __page_checks(self) -> List[Dict[str, Any]]:
+        checks = [{
+            "ok": self._enabled,
+            "title": "插件已启用" if self._enabled else "插件未启用",
+            "note": "" if self._enabled else "在设置中启用后才能生成封面",
+        }]
+        if not self._selected_servers:
+            checks.append({"ok": False, "title": "未选择媒体服务器", "note": "在设置的「基础」页选择"})
+        for server in self._selected_servers:
+            service = (self._servers or {}).get(server)
+            connected = False
+            try:
+                connected = bool(service) and not service.instance.is_inactive()
+            except Exception as error:
+                logger.debug(f"检查媒体服务器 {server} 失败: {error}")
+            checks.append({
+                "ok": connected,
+                "title": f"媒体服务器 {server} " + ("已连接" if connected else "未连接"),
+                "note": "" if connected else "请检查 MoviePilot 的媒体服务器配置",
+            })
+        checks.append({
+            "ok": not self._title_config_error,
+            "title": "标题配置有效" if not self._title_config_error else "标题配置无法解析",
+            "note": self._title_config_error,
+        })
+        _, _, zh_paths, en_paths = self.__get_font_presets()
+        spec = style_info(self.__current_index()).type
+        main_choice = self._zh_font_custom or self._zh_font_preset
+        sub_choice = self._en_font_custom or self._en_font_preset
+        zh_ready = self._zh_font_custom or zh_paths.get(spec.main_font if main_choice == AUTO_FONT else main_choice)
+        en_ready = self._en_font_custom or en_paths.get(spec.sub_font if sub_choice == AUTO_FONT else sub_choice)
+        checks.append({
+            "ok": True,
+            "title": "字体已就绪" if zh_ready and en_ready else "字体将在首次生成时下载",
+            "note": f"主标题 {'跟随风格' if main_choice == AUTO_FONT else main_choice}，"
+                    f"副标题 {'跟随风格' if sub_choice == AUTO_FONT else sub_choice}",
+        })
+        has_ffmpeg = bool(shutil.which("ffmpeg"))
+        checks.append({
+            "ok": has_ffmpeg,
+            "title": "ffmpeg 可用" if has_ffmpeg else "未找到 ffmpeg",
+            "note": "" if has_ffmpeg else "动态封面需要 ffmpeg，没有时会自动生成静态封面",
+        })
+        return checks
+
+    def __dir_size(self, directory: Path, pattern: Optional[re.Pattern] = None) -> int:
+        total = 0
+        try:
+            for root, _dirs, files in os.walk(directory):
+                for name in files:
+                    if pattern and not pattern.match(name):
+                        continue
+                    try:
+                        total += os.path.getsize(os.path.join(root, name))
+                    except OSError:
+                        continue
+        except OSError:
+            return total
+        return total
+
+    def __cache_sizes(self) -> Tuple[str, str]:
+        data_path = self.get_data_path()
+        image_bytes = sum(self.__dir_size(data_path / name) for name in ("input", "output", "covers", "preview"))
+        if self._covers_output:
+            custom_dir = Path(self._covers_output).expanduser()
+            if custom_dir.is_dir() and custom_dir.resolve() != (data_path / "output").resolve():
+                image_bytes += self.__dir_size(custom_dir, COVER_NAME_PATTERN)
+        return self.__format_size(image_bytes), self.__format_size(self.__dir_size(data_path / "fonts"))
 
     def get_page(self) -> List[dict]:
-        limit = self.__clamp_value(
-            self._covers_page_history_limit,
-            1,
-            500,
-            50,
-            "covers_page_history_limit[get_page]",
-            int,
-        )
+        limit = self.__clamp_value(self._covers_page_history_limit, 1, 500, 50,
+                                   "covers_page_history_limit[get_page]", int)
         style_variant, style_index = self.__get_cover_style_parts()
-        style_preview_cards = self.__build_page_style_cards(style_variant=style_variant, selected_index=style_index)
-        setup_warnings: List[str] = []
+
+        warnings: List[str] = []
         if not self._enabled:
-            setup_warnings.append("插件未启用，请先在设置页启用插件并保存。")
+            warnings.append("插件尚未启用，请在设置中启用并保存")
         if not self._selected_servers:
-            setup_warnings.append("未勾选媒体服务器，请先在设置页勾选服务器并保存。")
+            warnings.append("还没有选择媒体服务器，请在设置中选择并保存")
         elif not self._servers:
-            setup_warnings.append("服务器配置尚未生效，请在设置页保存后重试。")
+            warnings.append("媒体服务器配置尚未生效，请在设置中保存后重试")
+        if self._title_config_error:
+            warnings.append("标题配置无法解析，暂时只会使用媒体库名称作为标题")
 
-        # 永远默认首先访问封面生成页，不记忆用户的最后一次Tab选择，以提升开启速度
-        page_tab = "generate-tab"
-        
-        # 仅当明确切换到了历史封面页时，才执行耗时的图片加载逻辑
-        cover_rows = []
-        if self._page_tab == "history-tab":
-            page_tab = "history-tab"
-            recent_covers = self.__get_recent_generated_covers(limit=limit)
-            if recent_covers:
-                for item in recent_covers:
-                    delete_api = f"plugin/MediaCoverGenerator/delete_saved_cover?file={quote(item['path'])}"
-                    cover_rows.append(
-                        {
-                            "component": "VCol",
-                            "props": {"cols": 12, "sm": 6, "md": 3},
-                            "content": [
-                                {
-                                    "component": "VCard",
-                                    "props": {
-                                        "variant": "flat",
-                                        "elevation": 2,
-                                        "class": "rounded-lg",
-                                    },
-                                    "content": [
-                                        {
-                                            "component": "VImg",
-                                            "props": {
-                                                "src": item["src"],
-                                                "aspect-ratio": "16/9",
-                                                "cover": True,
-                                            },
-                                        },
-                                        {
-                                            "component": "VCardText",
-                                            "props": {"class": "py-2"},
-                                            "content": [
-                                                {
-                                                    "component": "VRow",
-                                                    "props": {"class": "align-center", "noGutters": True},
-                                                    "content": [
-                                                        {
-                                                            "component": "VCol",
-                                                            "props": {"cols": 9},
-                                                            "content": [
-                                                                {
-                                                                    "component": "div",
-                                                                    "props": {
-                                                                        "class": "text-body-2",
-                                                                        "style": "display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; line-height: 1.2rem; min-height: 2.4rem;"
-                                                                    },
-                                                                    "text": item["name"],
-                                                                },
-                                                                {
-                                                                    "component": "div",
-                                                                    "props": {"class": "text-caption text-medium-emphasis mt-1"},
-                                                                    "text": item["size"],
-                                                                },
-                                                            ],
-                                                        },
-                                                        {
-                                                            "component": "VCol",
-                                                            "props": {"cols": 3, "class": "text-right"},
-                                                            "content": [
-                                                                {
-                                                                    "component": "VBtn",
-                                                                    "props": {
-                                                                        "color": "error",
-                                                                        "variant": "text",
-                                                                        "size": "small",
-                                                                        "title": "删除",
-                                                                        "class": "text-none",
-                                                                    },
-                                                                    "text": "删除",
-                                                                    "events": {
-                                                                        "click": {
-                                                                            "api": delete_api,
-                                                                            "method": "post",
-                                                                        }
-                                                                    },
-                                                                }
-                                                            ],
-                                                        },
-                                                    ],
-                                                }
-                                            ],
-                                        },
-                                    ],
-                                }
-                            ],
-                        }
-                    )
-        elif self._page_tab == "history-tab":
-            cover_rows.append(
-                {
-                    "component": "VAlert",
-                    "props": {
-                        "type": "info",
-                        "variant": "tonal",
-                        "density": "compact",
-                    },
-                    "text": "未发现最近生成的封面文件。请先执行一次封面生成，或检查“封面另存目录”是否已配置。",
-                }
-            )
-            
-        if self._page_tab == "clean-tab":
-            page_tab = "clean-tab"
+        page_tab = self._page_tab if self._page_tab in {item[0] for item in PAGE_TABS} else "style"
+        all_covers = self.__list_saved_covers()
+        # 操作后整个页面都要重新下载。历史图片只在打开历史页时才带上，其他页签保持轻量
+        history = []
+        if page_tab == "history":
+            for cover in all_covers[:min(limit, self._history_visible)]:
+                source = self.__thumbnail(cover["file"])
+                if source:
+                    history.append({**cover, "src": source, "encoded_name": quote(cover["name"], safe="")})
 
-        return [
-            {
-                "component": "VCard",
-                "content": [
-                    {
-                        "component": "VTabs",
-                        "props": {"grow": True, "modelValue": page_tab},
-                        "content": [
-                            {
-                                "component": "VTab",
-                                "props": {"value": "generate-tab"},
-                                "text": "封面生成",
-                                "events": {"click": {"api": "plugin/MediaCoverGenerator/set_page_tab_generate", "method": "post"}},
-                            },
-                            {
-                                "component": "VTab",
-                                "props": {"value": "history-tab"},
-                                "text": "历史封面",
-                                "events": {"click": {"api": "plugin/MediaCoverGenerator/set_page_tab_history", "method": "post"}},
-                            },
-                            {
-                                "component": "VTab",
-                                "props": {"value": "clean-tab"},
-                                "text": "清理缓存",
-                                "events": {"click": {"api": "plugin/MediaCoverGenerator/set_page_tab_clean", "method": "post"}},
-                            },
-                        ],
-                    },
-                    {"component": "VDivider"},
-                ],
-            },
-        ] + (
-            [
-                {
-                    "component": "VCard",
-                    "props": {"variant": "outlined", "class": "mt-3"},
-                    "content": [
-                                    {
-                                        "component": "VCardText",
-                                        "content": [
-                                            {
-                                                "component": "VAlert",
-                                                "props": {
-                                                    "type": "warning",
-                                                    "variant": "tonal",
-                                                    "density": "compact",
-                                                    "class": "mb-3",
-                                                },
-                                                "text": "首次运行请先完成设置",
-                                            },
-                                            {
-                                                "component": "div",
-                                                "props": {"class": "text-caption text-medium-emphasis mb-2"},
-                                                "text": "；".join(setup_warnings),
-                                            },
-                                            {
-                                                "component": "VRow",
-                                                "content": [
-                                                    {
-                                                        "component": "VCol",
-                                            "props": {"cols": 12, "md": 9},
-                                            "content": [
-                                                            {
-                                                                "component": "VBtn",
-                                                                "props": {
-                                                                    "variant": "flat",
-                                                                    "color": "primary",
-                                                                    "class": "text-none mr-2 mb-2",
-                                                                    "prepend-icon": "mdi-swap-horizontal",
-                                                                },
-                                                    "text": f"切换到{'动态' if style_variant == 'static' else '静态'}",
-                                                    "events": {"click": {"api": "plugin/MediaCoverGenerator/toggle_style_variant", "method": "post"}},
-                                                },
-                                                            {
-                                                                "component": "VBtn",
-                                                                "props": {
-                                                                    "variant": "flat",
-                                                                    "color": "primary",
-                                                                    "class": "text-none mb-2",
-                                                                    "prepend-icon": "mdi-play-circle-outline",
-                                                                },
-                                                    "text": "立即生成当前风格",
-                                                    "events": {"click": {"api": "plugin/MediaCoverGenerator/generate_now", "method": "post"}},
-                                                },
-                                                {
-                                                    "component": "div",
-                                                    "props": {"class": "text-caption text-medium-emphasis ml-2 mb-2 d-inline-block"},
-                                                    "text": "更多参数请点击右下角齿轮设置",
-                                                },
-                                            ],
-                                        }
-                                    ],
-                                },
-                                {
-                                    "component": "VRow",
-                                    "content": style_preview_cards,
-                                },
-                            ],
-                        }
-                    ],
-                }
-            ] if page_tab == "generate-tab" and setup_warnings else
-            [
-                {
-                    "component": "VCard",
-                    "props": {"variant": "outlined", "class": "mt-3"},
-                    "content": [
-                                    {
-                                        "component": "VCardText",
-                                        "content": [
-                                            {
-                                                "component": "VRow",
-                                                "content": [
-                                                    {
-                                                        "component": "VCol",
-                                            "props": {"cols": 12, "md": 9},
-                                            "content": [
-                                                            {
-                                                                "component": "VBtn",
-                                                                "props": {
-                                                                    "variant": "flat",
-                                                                    "color": "primary",
-                                                                    "class": "text-none mr-2 mb-2",
-                                                                    "prepend-icon": "mdi-swap-horizontal",
-                                                                },
-                                                    "text": f"切换到{'动态' if style_variant == 'static' else '静态'}",
-                                                    "events": {"click": {"api": "plugin/MediaCoverGenerator/toggle_style_variant", "method": "post"}},
-                                                },
-                                                            {
-                                                                "component": "VBtn",
-                                                                "props": {
-                                                                    "variant": "flat",
-                                                                    "color": "primary",
-                                                                    "class": "text-none mb-2",
-                                                                    "prepend-icon": "mdi-play-circle-outline",
-                                                                },
-                                                    "text": "立即生成当前风格",
-                                                    "events": {"click": {"api": "plugin/MediaCoverGenerator/generate_now", "method": "post"}},
-                                                }
-                                            ],
-                                        }
-                                    ],
-                                },
-                                {
-                                    "component": "VRow",
-                                    "content": style_preview_cards,
-                                },
-                            ],
-                        }
-                    ],
-                }
-            ] if page_tab == "generate-tab" else
-            [
-                {
-                    "component": "VCard",
-                    "props": {"variant": "outlined", "class": "mt-3"},
-                    "content": [
-                        {"component": "VCardTitle", "text": f"最近生成的封面（最多 {limit} 条）"},
-                        {"component": "VCardText", "content": [{"component": "VRow", "content": cover_rows}]},
-                    ],
-                }
-            ] if page_tab == "history-tab" else
-            [
-                {
-                    "component": "VCard",
-                    "props": {"variant": "outlined", "class": "mt-3"},
-                    "content": [
-                        {
-                            "component": "VCardText",
-                            "props": {"class": "pa-6 d-flex flex-column align-center"},
-                            "content": [
-                                            {
-                                                "component": "VBtn",
-                                                "props": {
-                                                    "color": "error",
-                                                    "variant": "flat",
-                                                    "size": "large",
-                                                    "prepend-icon": "mdi-image-remove",
-                                                    "class": "mb-3 text-none",
-                                                },
-                                    "text": "立即清理图片缓存",
-                                    "events": {"click": {"api": "plugin/MediaCoverGenerator/clean_images", "method": "post"}},
-                                },
-                                            {
-                                                "component": "VBtn",
-                                                "props": {
-                                                    "color": "error",
-                                                    "variant": "flat",
-                                                    "size": "large",
-                                                    "prepend-icon": "mdi-format-font",
-                                                    "class": "mb-3 text-none",
-                                                },
-                                    "text": "立即清理字体缓存",
-                                    "events": {"click": {"api": "plugin/MediaCoverGenerator/clean_fonts", "method": "post"}},
-                                },
-                                {
-                                    "component": "div",
-                                    "props": {"class": "text-caption text-medium-emphasis"},
-                                    "text": "点击后立即执行，无需保存配置。",
-                                },
-                            ],
-                        }
-                    ],
-                }
-            ]
-        )
-    def __build_page_style_cards(self, style_variant: str, selected_index: int) -> List[Dict[str, Any]]:
-        styles = [
-            {"name": "风格1", "index": 1, "src": self.__style_preview_src(1)},
-            {"name": "风格2", "index": 2, "src": self.__style_preview_src(2)},
-            {"name": "风格3", "index": 3, "src": self.__style_preview_src(3)},
-            {"name": "风格4", "index": 4, "src": self.__style_preview_src(4)},
-        ]
-        cards: List[Dict[str, Any]] = []
-        for style in styles:
-            cards.append(
-                {
-                    "component": "VCol",
-                    "props": {"cols": 12, "sm": 6, "md": 3},
-                    "content": [
-                        {
-                            "component": "VCard",
-                            "props": {
-                                "variant": "flat",
-                                "elevation": 3 if style["index"] == selected_index else 1,
-                                "color": "primary" if style["index"] == selected_index else None,
-                                "class": "cursor-pointer",
-                            },
-                            "events": {
-                                "click": {
-                                    "api": f"plugin/MediaCoverGenerator/select_style_{style['index']}",
-                                    "method": "post",
-                                }
-                            },
-                            "content": [
-                                {
-                                    "component": "VImg",
-                                    "props": {
-                                        "src": style["src"],
-                                        "aspect-ratio": "16/9",
-                                        "cover": True,
-                                    },
-                                },
-                                {
-                                    "component": "VCardText",
-                                    "props": {"class": "py-2 text-center"},
-                                    "text": f"{style['name']}（{'静态' if style_variant == 'static' else '动态'}{style['index']}）" if style["index"] == selected_index else style["name"],
-                                },
-                            ],
-                        }
-                    ],
-                }
-            )
-        return cards
+        status_map = self.get_data("library_status") or {}
+        if not isinstance(status_map, dict):
+            status_map = {}
+        latest_by_library: Dict[str, Dict[str, Any]] = {}
+        for cover in all_covers:
+            latest_by_library.setdefault(cover["library"], cover)
 
-    @staticmethod
-    def __style_preview_src(index: int) -> str:
-        safe_index = max(1, min(4, int(index)))
-        return f"https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/images/style_{safe_index}.jpeg"
+        if not self._all_libraries and self._selected_servers:
+            # 插件加载时媒体服务器不可用，这里补一次（带缓存，不会每次刷新都请求）
+            self._all_libraries = [library for library in self.__libraries_for_form()
+                                   if library["server"] in self._selected_servers]
 
-    def __get_recent_generated_covers(self, limit: int = 20) -> List[Dict[str, Any]]:
+        libraries = []
+        for library in self._all_libraries:
+            key = library["value"]
+            library_name = library.get("library") or library["name"]
+            cover = latest_by_library.get(self.__sanitize_filename(library_name))
+            libraries.append({
+                "name": library_name,
+                "server": library.get("server", ""),
+                "key": key,
+                "encoded_key": quote(key, safe=""),
+                "active": self.__in_batch(key, library.get("type")),
+                "status": status_map.get(key),
+                "thumb": self.__thumbnail(cover["file"], (224, 126), 60) if cover else None,
+                "own_style": self._library_styles.get(key) or "",
+            })
+        for library in libraries:
+            if library["own_style"]:
+                own_variant, own_index = self.__get_cover_style_parts(library["own_style"])
+                library["own_variant"], library["own_index"] = own_variant, own_index
+        style_target = self._style_target if any(item["key"] == self._style_target for item in libraries) else ""
+
+        # 先读运行状态再读结果：任务恰好在两次读取之间结束时，也不会显示空闲却配上一轮的结果
+        task = dict(self._task)
+        if self._update_lock.locked():
+            task["running"] = True
+        last_time, last_message = self.__run_summary()
+        image_cache, font_cache = self.__cache_sizes()
+        # 横幅背景会被模糊，很小的图就够了
+        hero_image = self.__thumbnail(all_covers[0]["file"], (160, 90), 50) if all_covers else None
+        return build_page({
+            "local_preview": self.__local_preview_context() if page_tab == "style" else None,
+            "api_prefix": self.__api_prefix(),
+            "enabled": self._enabled,
+            "warnings": warnings,
+            "style_index": style_index,
+            "style_variant": style_variant,
+            "style_target": style_target,
+            "task": task,
+            "page_tab": page_tab,
+            "hero_image": hero_image,
+            "libraries": libraries,
+            "library_active": sum(1 for library in libraries if library["active"]),
+            "last_run_text": last_time,
+            "last_result": last_message,
+            "history": history,
+            "history_total": min(limit, len(all_covers)),
+            "history_limit": self._covers_history_limit_per_library,
+            "checks": self.__page_checks(),
+            "clean_armed": self._clean_armed,
+            "cache_images": image_cache,
+            "cache_fonts": font_cache,
+        })
+
+    def __list_saved_covers(self) -> List[Dict[str, Any]]:
+        """列出插件保存的封面（不读取图片内容），按时间倒序。"""
         items: List[Dict[str, Any]] = []
-        cover_dirs: List[Path] = []
-
-        if self._covers_output:
-            cover_dirs.append(Path(self._covers_output))
-        data_path = self.get_data_path()
-        default_output = data_path / "output"
-        if default_output.exists():
-            cover_dirs.append(default_output)
-
-        allowed_ext = {".jpg", ".jpeg", ".png", ".gif", ".apng", ".webp"}
         seen = set()
-        for directory in cover_dirs:
-            key = str(directory)
-            if key in seen:
+        for directory in self.__get_saved_cover_dirs():
+            if str(directory) in seen or not directory.is_dir():
                 continue
-            seen.add(key)
-            if not directory.exists() or not directory.is_dir():
+            seen.add(str(directory))
+            try:
+                entries = list(directory.iterdir())
+            except OSError as error:
+                logger.debug(f"读取封面目录失败 {directory}: {error}")
                 continue
-            for file_path in directory.iterdir():
-                if not file_path.is_file():
-                    continue
-                if file_path.suffix.lower() not in allowed_ext:
+            for file_path in entries:
+                match = COVER_NAME_PATTERN.match(file_path.name)
+                if not match or not file_path.is_file():
                     continue
                 try:
                     stat = file_path.stat()
-                    
-                    try:
-                        from PIL import Image
-                        from io import BytesIO
-                        import base64
-                        
-                        # 动态生成缩略图进行 Base64 传输
-                        # 1. 彻底绕开 /api/v1/plugin 外部接口存在的 401 鉴权问题
-                        # 2. 将几十 MB 的动图压缩为了几十 KB 的缩略图，解决前端加载卡死问题
-                        with Image.open(file_path) as img:
-                            if hasattr(img, 'is_animated') and img.is_animated:
-                                img.seek(0)
-                                
-                            thumb = img.copy()
-                            if thumb.mode != 'RGB':
-                                thumb = thumb.convert('RGB')
-                                
-                            thumb.thumbnail((480, 270))
-                            buf = BytesIO()
-                            thumb.save(buf, format="JPEG", quality=75)
-                            image_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-                            image_src = f"data:image/jpeg;base64,{image_b64}"
-                            
-                    except Exception as img_err:
-                        logger.debug(f"生成缩略图失败 {file_path}: {img_err}")
-                        continue
+                except OSError:
+                    continue
+                library = match.group(7) or ""
+                items.append({
+                    "name": file_path.name,
+                    "file": file_path,
+                    "library": library,
+                    "title": library or "历史封面",
+                    "mtime_ts": float(stat.st_mtime),
+                    "mtime": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%m-%d %H:%M"),
+                    "size": self.__format_size(stat.st_size),
+                })
+        items.sort(key=lambda item: item["mtime_ts"], reverse=True)
+        return items
 
-                    items.append(
-                        {
-                            "name": file_path.name,
-                            "path": str(file_path),
-                            "mtime_ts": float(stat.st_mtime),
-                            "mtime": datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
-                            "size": self.__format_size(stat.st_size),
-                            "src": image_src,
-                        }
-                    )
-                except Exception as e:
-                    logger.debug(f"读取封面文件信息失败: {file_path} -> {e}")
-
-        items.sort(key=lambda x: x.get("mtime_ts", 0.0), reverse=True)
-        return items[:max(1, int(limit))]
+    def __thumbnail(self, file_path: Path, size: Tuple[int, int] = (320, 180), quality: int = 65) -> Optional[str]:
+        """生成缩略图 data URI 并按文件修改时间缓存，页面刷新时不必重复解码原图。"""
+        try:
+            cache_key = (str(file_path), file_path.stat().st_mtime, size)
+        except OSError:
+            return None
+        with self._thumbnail_lock:
+            cached = self._thumbnail_cache.get(cache_key)
+            if cached:
+                self._thumbnail_cache.move_to_end(cache_key)
+                return cached
+        try:
+            with Image.open(file_path) as image:
+                if getattr(image, "is_animated", False):
+                    image.seek(0)
+                thumb = image.convert("RGB")
+                thumb.thumbnail(size)
+                buffer = BytesIO()
+                thumb.save(buffer, format="JPEG", quality=quality)
+        except Exception as error:
+            logger.debug(f"生成缩略图失败 {file_path}: {error}")
+            return None
+        source = "data:image/jpeg;base64," + base64.b64encode(buffer.getvalue()).decode("utf-8")
+        with self._thumbnail_lock:
+            self._thumbnail_cache[cache_key] = source
+            while len(self._thumbnail_cache) > THUMBNAIL_CACHE_SIZE:
+                self._thumbnail_cache.popitem(last=False)
+        return source
 
     @staticmethod
     def __format_size(size_bytes: int) -> str:
@@ -2776,22 +1606,15 @@ class MediaCoverGenerator(_PluginBase):
             unique.append(directory)
         return unique
 
-    def __resolve_saved_cover_path(self, raw_path: str) -> Optional[Path]:
-        if not raw_path:
+    def __resolve_saved_cover_path(self, raw_name: str) -> Optional[Path]:
+        """只接受文件名，且必须是保存目录下插件生成的封面。"""
+        name = Path(str(raw_name or "").strip()).name
+        if not COVER_NAME_PATTERN.match(name):
             return None
-        decoded = unquote(str(raw_path)).strip()
-        target = Path(decoded).expanduser()
-        if not target.is_absolute():
-            return None
-        allowed_dirs = self.__get_saved_cover_dirs()
-        for directory in allowed_dirs:
-            try:
-                root = directory.resolve()
-                file_path = target.resolve()
-                if str(file_path).startswith(str(root) + os.sep) or file_path == root:
-                    return file_path
-            except Exception:
-                continue
+        for directory in self.__get_saved_cover_dirs():
+            candidate = directory / name
+            if candidate.is_file():
+                return candidate
         return None
 
     def __get_recent_cover_output_dir(self) -> Path:
@@ -2804,90 +1627,180 @@ class MediaCoverGenerator(_PluginBase):
         """
         远程全量同步
         """
-        if event:
-            event_data = event.event_data
-            if not event_data or event_data.get("action") != "update_covers":
+        if not event:
+            return
+        event_data = event.event_data
+        if not event_data or event_data.get("action") != "update_covers":
+            return
+        channel, user = event_data.get("channel"), event_data.get("user")
+        if not self._enabled:
+            self.post_message(channel=channel, title="媒体库封面插件未启用", userid=user)
+            return
+        self.post_message(channel=channel, title="开始更新媒体库封面 ...", userid=user)
+
+        def run():
+            tips = self.__update_all_libraries(send_notification=False)
+            self.post_message(channel=channel, title=tips, userid=user)
+
+        # 全量更新可能持续很久，不占用事件线程
+        threading.Thread(target=run, name="MediaCoverGenerator", daemon=True).start()
+
+    def __schedule_monitor(self, key: str, handler) -> None:
+        """
+        入库事件先进入队列，延迟结束后统一处理。
+
+        批量入库时事件线程不会被长时间占用，同一媒体的多次入库也只处理一次。
+        """
+        with self._monitor_lock:
+            self._monitor_pending[key] = handler
+            if self._monitor_timer is None:
+                logger.info(f"将在 {self._delay} 秒后更新入库媒体所在媒体库的封面")
+                timer = threading.Timer(self._delay, self.__flush_monitor)
+                timer.daemon = True
+                self._monitor_timer = timer
+                timer.start()
+
+    def __flush_monitor(self):
+        with self._monitor_lock:
+            handlers = list(self._monitor_pending.values())
+            self._monitor_pending.clear()
+            self._monitor_timer = None
+        self._monitor_batch_updated = set()
+        for handler in handlers:
+            if not self._enabled or not self._transfer_monitor:
                 return
-            self.post_message(
-                channel=event.event_data.get("channel"),
-                title="开始更新媒体库封面 ...",
-                userid=event.event_data.get("user"),
-            )
-        tips = self.__update_all_libraries()
-        if event:
-            self.post_message(
-                channel=event.event_data.get("channel"),
-                title=tips,
-                userid=event.event_data.get("user"),
-            )
+            try:
+                handler()
+            except Exception as error:
+                logger.error(f"入库监控处理失败: {error}", exc_info=True)
 
     @eventmanager.register(EventType.TransferComplete)
     def update_library_cover(self, event: Event):
         """
         媒体整理完成后，更新所在库封面
         """
-        if not self._enabled:
+        if not self._enabled or not self._transfer_monitor:
             return
-        if not self._transfer_monitor:
-            return
-        
-        event_data = event.event_data    
+        event_data = event.event_data
         if not event_data:
             return
-        
-        # transfer: TransferInfo = event_data.get("transferinfo")        
-        # Event data
         mediainfo: MediaInfo = event_data.get("mediainfo")
-
-        # logger.info(f"转移信息：{transfer}")
-        # logger.info(f"元数据：{meta}")
-        # logger.info(f"媒体信息：{mediainfo}")
-        # logger.info(f"监控到的媒体信息：{mediainfo}")
         if not mediainfo:
             return
-            
-        # 开始前清理可能遗留的停止信号，防止阻塞监控
-        self._event.clear()
+        self.__schedule_monitor(f"transfer:{mediainfo.title_year}", lambda: self.__handle_transfer(mediainfo))
 
-        # Delay
-        if self._delay:
-            logger.info(f"延迟 {self._delay} 秒后开始更新封面")
-            time.sleep(int(self._delay))
-            
-        # Query the item in media server
-        existsinfo = self.mschain.media_exists(mediainfo=mediainfo)
-        if not existsinfo or not existsinfo.itemid:
-            self.mschain.sync()
+    def __handle_transfer(self, mediainfo: MediaInfo):
+        try:
+            # Query the item in media server
             existsinfo = self.mschain.media_exists(mediainfo=mediainfo)
-            if not existsinfo:
-                logger.warning(f"{mediainfo.title_year} 不存在媒体库中，可能服务器还未扫描完成，建议设置合适的延迟时间")
+            if not existsinfo or not existsinfo.itemid:
+                self.mschain.sync()
+                existsinfo = self.mschain.media_exists(mediainfo=mediainfo)
+                if not existsinfo or not existsinfo.itemid:
+                    logger.warning(f"{mediainfo.title_year} 不存在媒体库中，可能服务器还未扫描完成，建议设置合适的延迟时间")
+                    return
+
+            # Get item details including backdrop
+            iteminfo = self.mschain.iteminfo(server=existsinfo.server, item_id=existsinfo.itemid)
+            if not iteminfo:
+                logger.warning(f"获取 {mediainfo.title_year} 详情失败")
                 return
-        
-        # Get item details including backdrop
-        iteminfo = self.mschain.iteminfo(server=existsinfo.server, item_id=existsinfo.itemid)
-        # logger.info(f"获取到媒体项 {mediainfo.title_year} 详情：{iteminfo}")
-        if not iteminfo:
-            logger.warning(f"获取 {mediainfo.title_year} 详情失败")
+
+            self.__update_library_cover_item(
+                server=existsinfo.server,
+                item_id=existsinfo.itemid,
+                iteminfo=iteminfo,
+                title_year=mediainfo.title_year,
+            )
+        except Exception as error:
+            logger.error(f"入库监控查询 {mediainfo.title_year} 失败: {error}", exc_info=True)
+
+    @eventmanager.register(EventType.WebhookMessage)
+    def update_library_cover_webhook(self, event: Event):
+        """Update a library cover when Emby reports a new item via Webhook."""
+        if not self._enabled or not self._transfer_monitor:
             return
-            
-        # Try to get library ID
+
+        event_info = getattr(event, "event_data", None)
+        if not event_info:
+            return
+        event_type = getattr(event_info, "event", None)
+        if isinstance(event_info, dict):
+            event_type = event_info.get("event")
+            get_value = event_info.get
+        else:
+            get_value = lambda key, default=None: getattr(event_info, key, default)
+        if event_type != "library.new":
+            return
+
+        server = get_value("server_name")
+        item_id = get_value("item_id")
+        if not server or not item_id or not self._servers or server not in self._servers:
+            logger.debug("忽略缺少媒体服务器或媒体项 ID 的新入库 Webhook")
+            return
+        item_name = get_value("item_name")
+        self.__schedule_monitor(
+            f"webhook:{server}:{item_id}",
+            lambda: self.__handle_webhook(server, item_id, item_name),
+        )
+
+    def __handle_webhook(self, server, item_id, item_name):
+        try:
+            iteminfo = self.mschain.iteminfo(server=server, item_id=item_id)
+            if not iteminfo:
+                logger.warning(f"Webhook 新入库媒体 {item_name or item_id} 详情获取失败")
+                return
+
+            title_year = item_name or getattr(iteminfo, "name", None) or str(item_id)
+            self.__update_library_cover_item(
+                server=server,
+                item_id=item_id,
+                iteminfo=iteminfo,
+                title_year=title_year,
+            )
+        except Exception as error:
+            logger.error(f"Webhook 入库监控更新失败: {error}", exc_info=True)
+
+    def __update_library_cover_item(self, server, item_id, iteminfo, title_year):
+        """Resolve an item to its library and update that library cover."""
         library_id = None
         library = {}
-        item_id = existsinfo.itemid
-        server = existsinfo.server
-        service = self._servers.get(server)
+        service = self._servers.get(server) if self._servers else None
+        libraries = []
         if service:
             libraries = self.__get_server_libraries(service)
-        if libraries and not library_id:
-            library = next(
-                (library
-                 for library in libraries if library.get('Locations', []) 
-                 and any(iteminfo.path.startswith(path) for path in library.get('Locations', []))),
-                None
-            )
-        
+        if libraries:
+            # V3 MediaServerItem exposes its library ID; use it before path matching.
+            item_library_id = getattr(iteminfo, "library", None)
+            if isinstance(iteminfo, dict):
+                item_library_id = iteminfo.get("library") or iteminfo.get("LibraryId")
+            if item_library_id:
+                library = next(
+                    (
+                        candidate for candidate in libraries
+                        if str(candidate.get("Id") or candidate.get("ItemId"))
+                        == str(item_library_id)
+                    ),
+                    None,
+                )
+            if not library:
+                item_path = getattr(iteminfo, "path", None)
+                if isinstance(iteminfo, dict):
+                    item_path = iteminfo.get("path") or iteminfo.get("Path")
+                library = next(
+                    (
+                        candidate for candidate in libraries
+                        if candidate.get('Locations', [])
+                        and any(
+                            self.__path_is_under(item_path, path)
+                            for path in candidate.get('Locations', [])
+                        )
+                    ),
+                    None,
+                )
+
         if not library:
-            logger.warning(f"找不到 {mediainfo.title_year} 所在媒体库")
+            logger.warning(f"找不到 {title_year} 所在媒体库")
             return
         if service.type == 'emby':
             library_id = library.get("Id")
@@ -2897,125 +1810,241 @@ class MediaCoverGenerator(_PluginBase):
             logger.info(f"{server}：{library['Name']} 不在列表中，跳过更新封面")
             return
 
-        update_key = (server, item_id)
+        update_key = (server, str(library_id))
+        if update_key in self._monitor_batch_updated:
+            # 更新时已按最新入库排序，同一批事件里每个媒体库更新一次就够了
+            logger.info(f"媒体库 {server}：{library['Name']} 本批已更新，跳过 {title_year}")
+            return
         if update_key in self._current_updating_items:
-            logger.info(f"媒体库 {server}：{library['Name']} 的项目 {mediainfo.title_year} 正在更新中，跳过此次更新")
+            logger.info(f"媒体库 {server}：{library['Name']} 的项目 {title_year} 正在更新中，跳过此次更新")
             return
         # self.clean_cover_history(save=True)
         old_history = self.get_data('cover_history') or []
         # 新增去重判断逻辑
         latest_item = max(
-            (item for item in old_history if str(item.get("library_id")) == str(library_id)),
-            key=lambda x: x["timestamp"],
+            (
+                item for item in old_history
+                if isinstance(item, dict)
+                and str(item.get("server")) == str(server)
+                and str(item.get("library_id")) == str(library_id)
+                and item.get("timestamp") is not None
+            ),
+            key=lambda x: float(x.get("timestamp", 0)),
             default=None
         )
         if latest_item and str(latest_item.get("item_id")) == str(item_id):
-            logger.info(f"媒体 {mediainfo.title_year} 在库中是最新记录，不更新封面图")
+            logger.info(f"媒体 {title_year} 在库中是最新记录，不更新封面图")
             return
-        
-        # 安全地获取字体和翻译
-        try:
-            self.__get_fonts()
-        except Exception as e:
-            logger.error(f"初始化字体或翻译时出错: {e}")
-            # 继续执行，但可能会影响封面生成质量
-        new_history = self.update_cover_history(
-            server=server, 
-            library_id=library_id, 
-            item_id=item_id
-        )
-        # logger.info(f"最新数据： {new_history}")
-        self._monitor_sort = 'DateCreated'
-        self._current_updating_items.add(update_key)
-        if self.__update_library(service, library):
-            self._monitor_sort = ''
-            self._current_updating_items.remove(update_key)
-            logger.info(f"媒体库 {server}：{library['Name']} 封面更新成功")
 
-    
-    def __update_all_libraries(self):
+        if not self._update_lock.acquire(blocking=False):
+            logger.info(f"媒体库 {server} 正在执行全量更新，跳过入库监控任务 {title_year}")
+            return False
+        self._monitor_sort = 'DateCreated'
+        run_style = self.__library_style(f"{server}-{library_id}")
+        self._run_style = run_style
+        self._current_updating_items.add(update_key)
+        self._task = {"running": True, "total": 1, "done": 0, "current": f"{server}：{library['Name']}（入库更新）"}
+        self._failure_reason = ""
+        message = ""
+        try:
+            # 安全地获取字体和翻译
+            try:
+                self.__get_fonts()
+            except Exception as e:
+                logger.error(f"初始化字体时出错: {e}")
+            updated = self.__update_library(service, library)
+        except Exception as error:
+            logger.error(f"入库监控更新媒体库 {library['Name']} 失败: {error}", exc_info=True)
+            updated = False
+            message = str(error)
+        finally:
+            self._monitor_sort = ''
+            self._run_style = None
+            self._current_updating_items.discard(update_key)
+            self._task = {"running": False}
+            # 停止信号只针对当前任务，不能留给下一次入库更新
+            self._event.clear()
+            self._update_lock.release()
+        self.__record_library_result(server, library_id, library['Name'], bool(updated),
+                                     message or self._failure_reason, run_style)
+        if updated:
+            self._monitor_batch_updated.add(update_key)
+            self.update_cover_history(
+                server=server,
+                library_id=library_id,
+                item_id=item_id,
+            )
+            logger.info(f"媒体库 {server}：{library['Name']} 封面更新成功（入库监控）")
+        else:
+            logger.warning(f"媒体库 {server}：{library['Name']} 封面更新失败（入库监控）")
+        return updated
+
+    def __record_library_result(self, server, library_id, library_name, ok: bool, message: str = "", style: str = ""):
+        """记录每个媒体库最近一次的生成结果，显示在详情页。"""
+        try:
+            status_map = self.get_data("library_status") or {}
+            if not isinstance(status_map, dict):
+                status_map = {}
+            variant, index = self.__get_cover_style_parts(style)
+            status_map[f"{server}-{library_id}"] = {
+                "ok": ok,
+                "name": library_name,
+                "time": datetime.datetime.now().strftime("%m-%d %H:%M"),
+                "style": style_label(index, variant),
+                "message": message,
+            }
+            self.save_data("library_status", status_map)
+        except Exception as error:
+            logger.debug(f"记录媒体库生成结果失败: {error}")
+
+    def __update_all_libraries(self, library_key: Optional[str] = None, send_notification: bool = True):
         """
-        更新所有媒体库封面
+        更新媒体库封面。library_key 为空时更新全部（受「批量更新的媒体库」限制）。
+        无论结果如何都返回一句结果说明。
         """
         if not self._enabled:
-            return
+            return "插件未启用"
         # 所有媒体服务器
         if not self._servers:
-            return
-        logger.info("开始检查字体 ...")
-        try:
-            self.__get_fonts()
-        except Exception as e:
-            logger.error(f"初始化过程中出错: {e}")
-            logger.warning("将尝试继续执行，但可能影响封面生成质量")
+            return "未配置媒体服务器"
+        if not self._update_lock.acquire(blocking=False):
+            logger.warning("已有媒体库封面更新任务正在执行，跳过本次任务")
+            return "已有媒体库封面更新任务正在执行"
         logger.info("开始更新媒体库封面 ...")
-        # 开始前确保停止信号已清除
-        self._event.clear()
-        for server, service in self._servers.items():
-            # 扫描所有媒体库
-            logger.info(f"当前服务器 {server}")
-            cover_style = {
-                "static_1": "静态 1",
-                "static_2": "静态 2",
-                "static_3": "静态 3",
-                "static_4": "静态 4（全屏模糊）",
-                "animated_1": "卡片翻转动画",
-                "animated_2": "帷幕切换动画",
-                "animated_3": "斜向滚动动画",
-                "animated_4": "全屏模糊渐变"
-            }.get(self._cover_style, "静态 1")
-            logger.info(f"当前风格 {cover_style}")
-            # 获取媒体库列表
-            libraries = self.__get_server_libraries(service)
-            if not libraries:
-                logger.warning(f"服务器 {server} 的媒体库列表获取失败")
-                continue
-            success_count = 0
-            fail_count = 0
-            for library in libraries:
-                if self._event.is_set():
-                    logger.info("媒体库封面更新服务停止")
-                    self._event.clear()
-                    return
-                if service.type == 'emby':
-                    library_id = library.get("Id")
-                else:
-                    library_id = library.get("ItemId")
-                if self._include_libraries and f"{server}-{library_id}" not in self._include_libraries:
-                    logger.info(f"{server}：{library['Name']} 不在列表中，跳过更新封面")
+        # 手动启动时信号已在接口里清除，这里再清一次会吞掉启动瞬间发出的停止请求
+        if not self._task.get("running"):
+            self._event.clear()
+        # 任务开始时固定下来，运行中改设置不影响这一轮
+        default_style = self._cover_style
+        library_styles = dict(self._library_styles)
+        self._run_style = default_style
+        self._task = {"running": True, "total": 0, "done": 0, "current": ""}
+        total_success = 0
+        total_fail = 0
+        stopped = False
+        try:
+            logger.info("开始检查字体 ...")
+            try:
+                self.__get_fonts()
+            except Exception as e:
+                logger.error(f"初始化过程中出错: {e}")
+                logger.warning("将尝试继续执行，但可能影响封面生成质量")
+
+            variant, index = self.__get_cover_style_parts(default_style)
+            logger.info(f"默认风格 {style_label(index, variant)}，{len(library_styles)} 个媒体库单独设置")
+            targets = []
+            for server, service in self._servers.items():
+                libraries = self.__get_server_libraries(service)
+                if not libraries:
+                    logger.warning(f"服务器 {server} 的媒体库列表获取失败")
                     continue
-                if self.__update_library(service, library):
+                for library in libraries:
+                    library_id = library.get("Id") if service.type == 'emby' else library.get("ItemId")
+                    key = f"{server}-{library_id}"
+                    if library_key:
+                        if key != library_key:
+                            continue
+                    elif not self.__in_batch(key, library.get("CollectionType")):
+                        logger.info(f"{server}：{library['Name']} 不在列表中，跳过更新封面")
+                        continue
+                    targets.append((server, service, library, library_id))
+            self._task["total"] = len(targets)
+
+            for server, service, library, library_id in targets:
+                if self._event.is_set():
+                    stopped = True
+                    break
+                self._task["current"] = f"{server}：{library['Name']}"
+                self._failure_reason = ""
+                message = ""
+                self._run_style = library_styles.get(f"{server}-{library_id}") or default_style
+                try:
+                    updated = self.__update_library(service, library)
+                except Exception as error:
+                    logger.error(f"媒体库 {server}：{library['Name']} 更新异常: {error}", exc_info=True)
+                    updated = False
+                    message = str(error)
+                if self._event.is_set() and not updated:
+                    stopped = True
+                    break
+                self.__record_library_result(server, library_id, library['Name'], bool(updated),
+                                             message or self._failure_reason, self._run_style)
+                if updated:
                     logger.info(f"媒体库 {server}：{library['Name']} 封面更新成功")
-                    success_count += 1
+                    total_success += 1
                 else:
                     logger.warning(f"媒体库 {server}：{library['Name']} 封面更新失败")
-                    fail_count += 1
-        tips = f"媒体库封面更新任务结束，成功 {success_count} 个，失败 {fail_count} 个"
-        logger.info(tips)
+                    total_fail += 1
+                self._task["done"] = total_success + total_fail
+        finally:
+            if stopped:
+                tips = f"封面更新已停止，已完成 {total_success + total_fail} 个媒体库"
+            elif total_success + total_fail == 0:
+                tips = "没有需要更新的媒体库"
+            else:
+                tips = f"封面更新结束：成功 {total_success} 个，失败 {total_fail} 个"
+            logger.info(tips)
+            # 先写结果再释放锁，页面看到任务结束时一定能读到这一轮的结果
+            try:
+                self.save_data("last_run", {
+                    "time": datetime.datetime.now().strftime("%m-%d %H:%M"),
+                    "message": tips,
+                })
+            except Exception as error:
+                logger.debug(f"记录运行结果失败: {error}")
+            self._monitor_sort = ''
+            self._run_style = None
+            self._current_updating_items.clear()
+            self._event.clear()
+            self._task = {"running": False}
+            self._update_lock.release()
+
+        if send_notification and self._notify:
+            self.post_message(mtype=NotificationType.Plugin, title="媒体库封面更新", text=tips)
         return tips
-                 
+
+    def __in_batch(self, key: str, library_type: Optional[str]) -> bool:
+        """
+        判断媒体库是否参与批量更新。
+
+        电视直播的封面常常是手动设置的，而自动取到的多半只是台标，
+        所以「全部媒体库」不包含它，需要单独勾选或单独点生成。
+        """
+        if self._include_libraries:
+            return key in self._include_libraries
+        return library_type != LIVE_TV_TYPE
 
     def __update_library(self, service, library):
+        self._pending_history = []
+        image_data = self.__build_library_image(service, library)
+        if not image_data or not self.__set_library_image(service, library, image_data):
+            return False
+        # 上传成功才算这些图用过。失败时不记录，入库更新才能重试
+        library_id = library.get("Id") if service.type == 'emby' else library.get("ItemId")
+        for item_id in reversed(self._pending_history):
+            self.update_cover_history(server=service.name, library_id=library_id, item_id=item_id)
+        self._pending_history = []
+        return True
+
+    def __build_library_image(self, service, library):
+        """准备素材并生成封面图片，不上传。"""
         library_name = library['Name']
         logger.info(f"媒体库 {service.name}：{library_name} 开始准备更新封面")
-        # 自定义图像路径
-        image_path = self.__check_custom_image(library_name)
         # 从配置获取标题和背景颜色
-        title_result = self.__get_title_from_config(library_name)
-        if len(title_result) == 3:
-            title = (title_result[0], title_result[1])
-            config_bg_color = title_result[2]
-        else:
-            title = title_result
-            config_bg_color = None
-        if image_path:
+        zh_title, en_title, config_bg_color = self.__get_title_from_config(library_name)
+        title = (zh_title, en_title)
+        # 预览的 8 款风格用同一批素材，才看得出风格之间的差别
+        if self._preview_mode and self._preview_stocked:
+            return self.__generate_cover(service.name, library_name, title, config_bg_color)
+        custom_images = self.__check_custom_image(library_name)
+        if custom_images:
             logger.info(f"媒体库 {service.name}：{library_name} 从自定义路径获取封面")
-            image_data = self.__generate_image_from_path(service.name, library_name, title, image_path[0], config_bg_color)
+            self.__stage_custom_images(library_name, custom_images)
+            image_data = self.__generate_cover(service.name, library_name, title, config_bg_color)
         else:
             image_data = self.__generate_from_server(service, library, title)
-
-        if image_data:
-            return self.__set_library_image(service, library, image_data)
+        self._preview_stocked = self._preview_mode and bool(image_data)
+        return image_data
 
     def __check_custom_image(self, library_name):
         if not self._covers_input:
@@ -3032,11 +2061,95 @@ class MediaCoverGenerator(_PluginBase):
             for f in os.listdir(library_dir)
             if f.lower().endswith((".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"))
         ])
-        
-        return images if images else None  # 或改为 return images if images else False
+
+        return images if images else None
+
+    def __library_work_dir(self, library_name) -> Path:
+        return Path(self._covers_path) / self.__sanitize_filename(library_name)
+
+    @staticmethod
+    def __clear_numbered_images(directory: Path):
+        """清除上一轮的编号素材，避免本轮数量不足时混入旧图。"""
+        if not directory.is_dir():
+            return
+        for entry in directory.iterdir():
+            if entry.is_file() and NUMBERED_IMAGE_PATTERN.match(entry.name):
+                entry.unlink(missing_ok=True)
+
+    def __stage_custom_images(self, library_name, images: List[str]):
+        """把自定义图片随机抽样复制到工作目录，不改动用户的目录。"""
+        work_dir = self.__library_work_dir(library_name)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        self.__clear_numbered_images(work_dir)
+        required = self.__get_required_items()
+        chosen = random.sample(images, min(required, len(images)))
+        for index, source in enumerate(chosen, start=1):
+            shutil.copy(source, work_dir / f"{index}.jpg")
+
+    def __font_supports_text(self, font_path, text: str) -> bool:
+        """判断字体是否包含文字里的中日韩字符；缺字时 PIL 会绘制 .notdef 方框。"""
+        characters = [char for char in str(text or "") if ord(char) >= 0x2E80][:16]
+        if not characters:
+            return True
+        try:
+            font = ImageFont.truetype(str(font_path), 48)
+            missing = font.getmask("\U0010FFFF")
+            missing_key = (missing.size, bytes(missing))
+            # 缺一个字也算不支持，否则「電影」这样只缺一半的标题会画出方框
+            return not any((font.getmask(char).size, bytes(font.getmask(char))) == missing_key
+                           for char in characters)
+        except Exception as error:
+            logger.debug(f"检查字体字符集失败 {font_path}: {error}")
+            return True
+
+    def __title_fonts(self, title, spec: TypeSpec) -> Optional[Tuple[str, str]]:
+        """
+        确定这个标题实际使用的字体。没有指定字体时按风格的设计取用，只下载这个标题用得到的字体。
+        所选字体缺字时换成能显示的字体，避免出现方框。
+        """
+        main_text, sub_text = title
+        own_main = bool(self._zh_font_custom) or self._zh_font_preset != AUTO_FONT
+        own_sub = bool(self._en_font_custom) or self._en_font_preset != AUTO_FONT
+
+        def preset_font(preset):
+            path = self.__resolve_font("字体", preset, "", "style")
+            return str(path) if path else None
+
+        sub_font = (str(self._en_font_path) if self._en_font_path else None) if own_sub else preset_font(spec.sub_font)
+        if own_main:
+            main_font = str(self._zh_font_path) if self._zh_font_path else None
+            # 粗书体的英文字形很细，纯英文的主标题用副标题字体更好看
+            if (self._zh_font_preset == "pangmen" and not self._zh_font_custom and sub_font
+                    and str(main_text or "").strip() and not is_cjk_text(main_text)):
+                main_font = sub_font
+        else:
+            main_font = preset_font(spec.main_font if is_cjk_text(main_text) else spec.main_font_latin)
+        if not main_font or not sub_font:
+            return None
+
+        if not self.__font_supports_text(main_font, main_text):
+            logger.warning(f"主标题字体不支持「{main_text}」，已改用其他字体")
+            main_font = next((font for font in (sub_font, preset_font(spec.main_font), preset_font(WIDEST_FONT))
+                              if font and self.__font_supports_text(font, main_text)), main_font)
+        if not self.__font_supports_text(sub_font, sub_text):
+            logger.info(f"副标题字体不支持「{sub_text}」，已改用其他字体")
+            sub_font = next((font for font in (main_font, preset_font(spec.main_font), preset_font(WIDEST_FONT))
+                             if font and self.__font_supports_text(font, sub_text)), sub_font)
+        return main_font, sub_font
+
+    @staticmethod
+    def __optional_number(value) -> Optional[float]:
+        """设置项留空时返回 None，表示跟随风格。0 是合法取值。"""
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            logger.warning(f"配置值非法 ({value})，已改为跟随风格")
+            return None
 
     @memory_efficient_operation
-    def __generate_image_from_path(self, server, library_name, title, image_path=None, config_bg_color=None):
+    def __generate_cover(self, server, library_name, title, config_bg_color=None):
         logger.info(f"媒体库 {server}：{library_name} 正在生成封面图 ...")
 
         # 执行健康检查
@@ -3044,325 +2157,208 @@ class MediaCoverGenerator(_PluginBase):
             logger.error("插件健康检查失败，无法生成封面")
             return False
 
-        # 确保分辨率配置已初始化
-        if not hasattr(self, '_resolution_config') or self._resolution_config is None:
-            logger.warning("分辨率配置未初始化，重新初始化")
-            # 使用用户设置的分辨率，而不是硬编码的1080p
-            if self._resolution == "custom":
-                try:
-                    custom_w = int(self._custom_width)
-                    custom_h = int(self._custom_height)
-                    self._resolution_config = ResolutionConfig((custom_w, custom_h))
-                except ValueError:
-                    logger.warning(f"自定义分辨率参数无效: {self._custom_width}x{self._custom_height}, 使用默认1080p")
-                    self._resolution_config = ResolutionConfig("1080p")
-            else:
-                self._resolution_config = ResolutionConfig(self._resolution)
+        style = self.__current_style()
+        animated = style in ANIMATED_STYLES
+        if animated and not shutil.which("ffmpeg"):
+            logger.warning("未找到 ffmpeg，无法生成动态封面，这次改为生成静态封面")
+            animated = False
+        index = self.__current_index()
+        info = style_info(index)
 
-        # 使用分辨率配置计算字体大小
-        try:
-            base_zh_font_size = float(self._zh_font_size) if self._zh_font_size else 170
-        except ValueError:
-            base_zh_font_size = 170
-            
-        try:
-            base_en_font_size = float(self._en_font_size) if self._en_font_size else 75
-        except ValueError:
-            base_en_font_size = 75
-
-        try:
-            title_scale = float(self._title_scale) if self._title_scale else 1.0
-        except (ValueError, TypeError):
-            title_scale = 1.0
-        if title_scale <= 0:
-            title_scale = 1.0
-        if self._cover_style.startswith("animated"):
-            zh_font_size = float(base_zh_font_size) * title_scale
-            en_font_size = float(base_en_font_size) * title_scale
-        else:
-            # 静态风格按当前分辨率缩放
-            zh_font_size = self._resolution_config.get_font_size(base_zh_font_size) * title_scale
-            en_font_size = self._resolution_config.get_font_size(base_en_font_size) * title_scale
-
-        blur_size = self._blur_size or 50
-        color_ratio = self._color_ratio or 0.8
-
-        # 检查字体路径是否有效
-        if not self._zh_font_path or not self._en_font_path:
+        fonts = self.__title_fonts(title, info.type)
+        if not fonts:
+            self._failure_reason = "字体下载失败，请检查网络或在设置里指定字体"
             logger.error("字体路径未设置或无效，无法生成封面")
             return False
 
-        # 验证字体文件是否存在
-        if not validate_font_file(Path(self._zh_font_path)):
-            logger.error(f"主标题字体文件无效: {self._zh_font_path}")
+        letter_percent = lambda value: None if value is None else value / 100.0  # noqa: E731
+        spec = apply_overrides(
+            info.type,
+            main_size=self.__optional_number(self._zh_font_size),
+            sub_size=self.__optional_number(self._en_font_size),
+            scale=self.__to_number(self._title_scale, 1.0, float),
+            offset_y=self.__optional_number(self._zh_font_offset),
+            spacing=self.__optional_number(self._title_spacing),
+            sub_line_gap=self.__optional_number(self._en_line_spacing),
+            main_tracking=letter_percent(self.__optional_number(self._zh_letter_spacing)),
+            sub_tracking=letter_percent(self.__optional_number(self._en_letter_spacing)),
+        )
+
+        display_font = None
+        if info.display:
+            # 下载失败也不要紧，风格会退回标题字体
+            display_path = self.__resolve_font("展示", info.display, "", "style")
+            display_font = str(display_path) if display_path else None
+
+        library_dir = self.__library_work_dir(library_name)
+        required = self.__style_item_count()
+        if not self.__has_material(library_dir):
+            logger.warning(f"素材目录里没有图片 {library_dir}")
+            self._failure_reason = self._failure_reason or "没有可用的素材图片"
             return False
 
-        if not validate_font_file(Path(self._en_font_path)):
-            logger.error(f"副标题字体文件无效: {self._en_font_path}")
-            return False
+        if animated and self._preview_mode:
+            width, height = PREVIEW_SIZE
+        elif animated:
+            width, height = (int(value) for value in self._animation_resolution.split("x"))
+        else:
+            width, height = int(self._resolution_config.width), int(self._resolution_config.height)
+        logger.info(f"当前风格 {info.name}，画布 {width}x{height}")
 
-        font_path = (str(self._zh_font_path), str(self._en_font_path))
-        font_size = (float(zh_font_size), float(en_font_size))
+        return create_cover(
+            index, animated, library_dir, title, fonts, spec, (width, height),
+            image_count=required,
+            # 0 是合法取值，只有未填写时才使用默认值
+            blur_size=50 if self._blur_size is None else self._blur_size,
+            color_ratio=0.8 if self._color_ratio is None else self._color_ratio,
+            bg_color_config={
+                "mode": self._bg_color_mode,
+                "custom_color": self._custom_bg_color,
+                "config_color": config_bg_color,
+            },
+            animation_duration=12 if self._preview_mode else self._animation_duration,
+            animation_fps=12 if self._preview_mode else self._animation_fps,
+            animation_reduce_colors="medium" if self._preview_mode else self._animation_reduce_colors,
+            stop_event=self._event,
+            display_font=display_font,
+        )
 
-        zh_font_offset = float(self._zh_font_offset or 0)
-        title_spacing = float(self._title_spacing or 40) * title_scale
-        en_line_spacing = float(self._en_line_spacing or 40) * title_scale
-        font_offset = (float(zh_font_offset), float(title_spacing), float(en_line_spacing))
-
-        # 记录分辨率配置信息
-        logger.info(f"当前分辨率配置: {self._resolution_config}")
-
-        # 准备背景颜色配置
-        bg_color_config = {
-            'mode': self._bg_color_mode,
-            'custom_color': self._custom_bg_color,
-            'config_color': config_bg_color
-        }
-
-        # 传递分辨率配置给图像生成函数
-        if self._cover_style == 'static_1':
-            image_data = create_style_static_1(image_path, title, font_path,
-                                                font_size=font_size,
-                                                font_offset=font_offset,
-                                                blur_size=blur_size,
-                                                color_ratio=color_ratio,
-                                                resolution_config=self._resolution_config,
-                                                bg_color_config=bg_color_config)
-        elif self._cover_style == 'static_2':
-            image_data = create_style_static_2(image_path, title, font_path,
-                                                font_size=font_size,
-                                                font_offset=font_offset,
-                                                blur_size=blur_size,
-                                                color_ratio=color_ratio,
-                                                resolution_config=self._resolution_config,
-                                                bg_color_config=bg_color_config)
-        elif self._cover_style == 'static_4':
-            image_data = create_style_static_4(image_path, title, font_path,
-                                                font_size=font_size,
-                                                font_offset=font_offset,
-                                                blur_size=blur_size,
-                                                color_ratio=color_ratio,
-                                                resolution_config=self._resolution_config,
-                                                bg_color_config=bg_color_config)
-        elif self._cover_style == 'static_3':
-            # 使用安全的文件名
-            safe_library_name = self.__sanitize_filename(library_name)
-            if image_path:
-                library_dir = Path(self._covers_input) / safe_library_name
-            else:
-                library_dir = Path(self._covers_path) / safe_library_name
-            logger.info(f"static_3: 准备图片目录 {library_dir}")
-            if self.prepare_library_images(library_dir, required_items=9):
-                logger.info("static_3: 图片目录准备完成，开始生成封面")
-                image_data = create_style_static_3(library_dir, title, font_path,
-                                                    font_size=font_size,
-                                                    font_offset=font_offset,
-                                                    is_blur=self._multi_1_blur,
-                                                    blur_size=blur_size,
-                                                    color_ratio=color_ratio,
-                                                    resolution_config=self._resolution_config,
-                                                    bg_color_config=bg_color_config)
-            else:
-                logger.warning(f"static_3: 图片目录准备失败 {library_dir}")
-        elif self._cover_style == 'animated_3':
-            # 动态封面强制使用 320x180 分辨率以保证性能
-            anim_res = '320x180'
-            logger.info(f"强制动图生成分辨率为: {anim_res}")
-            
-            # 动态封面逻辑，类似于 multi_1
-            safe_library_name = self.__sanitize_filename(library_name)
-            if image_path:
-                library_dir = Path(self._covers_input) / safe_library_name
-            else:
-                library_dir = Path(self._covers_path) / safe_library_name
-            
-            logger.info(f"正在准备库图片目录: {library_dir}")
-            if self.prepare_library_images(library_dir, required_items=9):
-                logger.info("库图片准备完成，开始调用 create_style_animated_3")
-                image_data = create_style_animated_3(library_dir, title, font_path,
-                                                    font_size=font_size,
-                                                    font_offset=font_offset,
-                                                    is_blur=self._multi_1_blur,
-                                                    blur_size=blur_size,
-                                                    color_ratio=color_ratio,
-                                                    resolution_config=self._resolution_config,
-                                                    bg_color_config=bg_color_config,
-                                                    animation_duration=self._animation_duration,
-                                                    animation_scroll=self._animation_scroll,
-                                                    animation_fps=self._animation_fps,
-                                                    animation_format=self._animation_format,
-                                                    animation_resolution=anim_res,
-                                                    animation_reduce_colors=self._animation_reduce_colors,
-                                                    stop_event=self._event)
-        elif self._cover_style == 'animated_1':
-            # 动态封面强制使用 320x180 分辨率以保证性能
-            anim_res = '320x180'
-            logger.info(f"强制动图生成分辨率为: {anim_res}")
-
-            animated_2_image_count = self.__get_animated_2_required_items()
-
-            # 动态封面逻辑，类似于 multi_1
-            safe_library_name = self.__sanitize_filename(library_name)
-            if image_path:
-                library_dir = Path(self._covers_input) / safe_library_name
-            else:
-                library_dir = Path(self._covers_path) / safe_library_name
-
-            logger.info(f"正在准备库图片目录: {library_dir}")
-            if self.prepare_library_images(library_dir, required_items=animated_2_image_count):
-                logger.info("库图片准备完成，开始调用 create_style_animated_1")
-                image_data = create_style_animated_1(library_dir, title, font_path,
-                                                    font_size=font_size,
-                                                    font_offset=font_offset,
-                                                    is_blur=self._multi_1_blur,
-                                                    blur_size=blur_size,
-                                                    color_ratio=color_ratio,
-                                                    resolution_config=self._resolution_config,
-                                                    bg_color_config=bg_color_config,
-                                                    animation_duration=self._animation_duration,
-                                                    animation_fps=self._animation_fps,
-                                                    animation_format=self._animation_format,
-                                                    animation_resolution=anim_res,
-                                                    animation_reduce_colors=self._animation_reduce_colors,
-                                                    image_count=animated_2_image_count,
-                                                    departure_type=self._animated_2_departure_type,
-                                                    stop_event=self._event)
-        elif self._cover_style == 'animated_2':
-            # 动态封面强制使用 320x180 分辨率以保证性能
-            anim_res = '320x180'
-            logger.info(f"强制动图生成分辨率为: {anim_res}")
-
-            safe_library_name = self.__sanitize_filename(library_name)
-            if image_path:
-                library_dir = Path(self._covers_input) / safe_library_name
-            else:
-                library_dir = Path(self._covers_path) / safe_library_name
-
-            logger.info(f"正在准备库图片目录: {library_dir}")
-            if self.prepare_library_images(library_dir, required_items=9):
-                logger.info("库图片准备完成，开始调用 create_style_animated_2")
-                image_data = create_style_animated_2(library_dir, title, font_path,
-                                                    font_size=font_size,
-                                                    font_offset=font_offset,
-                                                    is_blur=self._multi_1_blur,
-                                                    blur_size=blur_size,
-                                                    color_ratio=color_ratio,
-                                                    resolution_config=self._resolution_config,
-                                                    bg_color_config=bg_color_config,
-                                                    animation_duration=self._animation_duration,
-                                                    animation_fps=self._animation_fps,
-                                                    animation_format=self._animation_format,
-                                                    animation_resolution=anim_res,
-                                                    animation_reduce_colors=self._animation_reduce_colors,
-                                                    image_count=self.__get_animated_2_required_items(),
-                                                    stop_event=self._event)
-        elif self._cover_style == 'animated_4':
-            anim_res = '320x180'
-            logger.info(f"强制动图生成分辨率为: {anim_res}")
-
-            animated_2_image_count = self.__get_animated_2_required_items()
-
-            safe_library_name = self.__sanitize_filename(library_name)
-            if image_path:
-                library_dir = Path(self._covers_input) / safe_library_name
-            else:
-                library_dir = Path(self._covers_path) / safe_library_name
-
-            logger.info(f"正在准备库图片目录: {library_dir}")
-            if self.prepare_library_images(library_dir, required_items=animated_2_image_count):
-                logger.info("库图片准备完成，开始调用 create_style_animated_4")
-                image_data = create_style_animated_4(library_dir, title, font_path,
-                                                    font_size=font_size,
-                                                    font_offset=font_offset,
-                                                    is_blur=self._multi_1_blur,
-                                                    blur_size=blur_size,
-                                                    color_ratio=color_ratio,
-                                                    resolution_config=self._resolution_config,
-                                                    bg_color_config=bg_color_config,
-                                                    animation_duration=self._animation_duration,
-                                                    animation_fps=self._animation_fps,
-                                                    animation_format=self._animation_format,
-                                                    animation_resolution=anim_res,
-                                                    animation_reduce_colors=self._animation_reduce_colors,
-                                                    image_count=animated_2_image_count,
-                                                    stop_event=self._event)
-        return image_data
-    
     def __generate_from_server(self, service, library, title):
 
         logger.info(f"媒体库 {service.name}：{library['Name']} 开始筛选媒体项")
         required_items = self.__get_required_items()
-        
+
         # 获取项目集合
         items = []
         offset = 0
         batch_size = 50  # 每次获取的项目数量
         max_attempts = 20  # 最大尝试次数，防止无限循环
-        
+
         library_type = library.get('CollectionType')
         if service.type == 'emby':
             library_id = library.get("Id")
         else:
             library_id = library.get("ItemId")
         parent_id = library_id
-        
+
         # 处理合集类型的特殊情况
         if library_type == "boxsets":
             return self.__handle_boxset_library(service, library, title)
         elif library_type == "playlists":
             return self.__handle_playlist_library(service, library, title)
+        elif library_type == LIVE_TV_TYPE:
+            return self.__handle_live_tv_library(service, library, title)
         elif library_type == "music":
             include_types = 'MusicAlbum,Audio'
         else:
-            # 基础类型映射
-            if self.__is_single_image_style():
-                include_types = {
-                    "PremiereDate": "Movie,Series",
-                    "DateCreated": "Movie,Episode",
-                    "Random": "Movie,Series"
-                }.get(self._sort_by, "Movie,Series")
-            else:
-                # 对于多图样式，如果按最新入库排序（DateCreated），也要包含 Episode 以展示剧集的最新动态
-                if self._sort_by == "DateCreated":
-                    include_types = "Movie,Episode"
-                else:
-                    # 其他排序方式默认使用 Series 获取海报
-                    include_types = "Movie,Series"
+            # 按最新入库排序时也要包含 Episode，展示剧集的最新动态；其他排序取 Series 的海报
+            include_types = "Movie,Episode" if self._sort_by == "DateCreated" else "Movie,Series"
             logger.debug(f"媒体库筛选类型: {include_types}, 排序方式: {self._sort_by}")
         self._seen_keys = set()
+        # 多拉一些候选，打分后挑最适合做封面的；按入库时间排序时只往后多看一点，保持「最新」的意思
+        keep_order = self._sort_by == "DateCreated" or bool(self._monitor_sort)
+        pool_size = min(SELECTION_POOL_MAX, required_items * (2 if keep_order else SELECTION_POOL_FACTOR))
         for attempt in range(max_attempts):
             if self._event.is_set():
                 logger.info("检测到停止信号，中断媒体项获取 ...")
                 return False
-                
+
             batch_items = self.__get_items_batch(service, parent_id,
                                               offset=offset, limit=batch_size,
                                               include_types=include_types)
-            
+
             if not batch_items:
                 break  # 没有更多项目可获取
-                
+
             # 筛选有效项目（有所需图片的项目）
             valid_items = self.__filter_valid_items(batch_items)
             items.extend(valid_items)
-            
-            # 如果已经有足够的有效项目，则停止获取
-            if len(items) >= required_items:
+
+            # 候选够多就停止获取
+            if len(items) >= pool_size:
                 break
-                
+
             offset += batch_size
-        
+
         # 使用获取到的有效项目更新封面
         if len(items) > 0:
             logger.info(f"媒体库 {service.name}：{library['Name']} 找到 {len(items)} 个有效项目")
-            if self.__is_single_image_style():
-                return self.__update_single_image(service, library, title, items[0])
-            else:
-                return self.__update_grid_image(service, library, title, items[:required_items])
+            if self._sort_by == "Random" and not self._monitor_sort:
+                # 顺序本来就是随机的，优先用海报和背景图都有的条目，取景的余地更大
+                items.sort(key=lambda item: 0 if all(self.__image_sets(item)) else 1)
+            chosen = self.__choose_items(service, library, items[:pool_size], required_items, keep_order)
+            return self.__update_grid_image(service, library, title, chosen)
         else:
+            self._failure_reason = "媒体库里没有可用的图片"
             logger.warning(f"媒体库 {service.name}：{library['Name']} 无法找到有效的图片项目 (筛选类型: {include_types})")
             return False
-        
+
+    def __choose_items(self, service, library, items, required, keep_order):
+        """
+        给每个候选下载一张小图打分，挑出适合做封面的：太暗、发糊的截图、脸部特写过近的往后放。
+        第一张是静态封面和动图的第一帧，放分数最高的。评分失败的条目按合格处理，不会因此少图。
+        """
+        # 风格一屏要摆的图不能少，多出来的轮换图宁可少几张；预览的 8 款共用一批，按最多的那款算
+        minimum = (max(entry.slots for entry in STYLE_CATALOG) if self._preview_mode
+                   else style_info(self.__current_index()).slots)
+        # 条目不多、没得挑时也要打分：至少把最好的那张放在第一帧
+        if len(items) <= 1:
+            return items
+        assessed = []
+        for item in items:
+            if self._event.is_set():
+                break
+            result = None
+            urls = self.__material_urls(item)
+            if urls:
+                url = urls[0].replace(f"maxWidth={MATERIAL_MAX_SIZE}&maxHeight={MATERIAL_MAX_SIZE}",
+                                      f"maxWidth={SELECTION_PREVIEW_SIZE}&maxHeight={SELECTION_PREVIEW_SIZE}")
+                try:
+                    response = service.instance.get_data(url=url)
+                    if response is not None and response.status_code == 200 and response.content:
+                        with Image.open(BytesIO(response.content)) as opened:
+                            result = assess(opened.convert("RGB"), key=url)
+                except Exception as error:
+                    logger.debug(f"选图评分失败，按合格处理：{error}")
+            assessed.append((item, result))
+        chosen, skipped = rank(assessed, required, keep_order=keep_order, minimum=minimum)
+        dropped = [(item, result) for item, result in skipped if result is not None and result.score < ACCEPT_SCORE]
+        if dropped:
+            details = "；".join(f"{item.get('Name') or item.get('Id')}（{result.describe()}）" for item, result in dropped[:8])
+            logger.info(f"媒体库 {library['Name']}：从 {len(assessed)} 个候选里选了 {len(chosen)} 个，没用的：{details}")
+        else:
+            logger.info(f"媒体库 {library['Name']}：从 {len(assessed)} 个候选里选了 {len(chosen)} 个")
+        return [item for item, _result in chosen]
+
+    def __handle_live_tv_library(self, service, library, title):
+        """电视直播优先用正在播出节目的海报，没有时用频道图片（通常是台标）。"""
+        required_items = self.__get_required_items()
+        self._seen_keys = set()
+        valid_items = []
+        common = 'api_key=[APIKEY]&UserId=[USER]&EnableImages=true&Limit=100'
+        for url in (
+            f'[HOST]emby/LiveTv/Programs?{common}&IsAiring=true',
+            f'[HOST]emby/LiveTv/Channels?{common}',
+        ):
+            if self._event.is_set():
+                return False
+            try:
+                res = service.instance.get_data(url=url)
+                items = res.json().get("Items", []) if res else []
+            except Exception as err:
+                logger.warning(f"获取电视直播内容失败：{str(err)}")
+                items = []
+            random.shuffle(items)
+            valid_items.extend(self.__filter_valid_items(items))
+            if len(valid_items) >= required_items:
+                break
+
+        if not valid_items:
+            self._failure_reason = "没有找到节目或频道图片，可以使用自定义图片目录"
+            logger.warning(f"媒体库 {service.name}：{library['Name']} {self._failure_reason}")
+            return False
+        return self.__update_grid_image(service, library, title, valid_items[:required_items])
+
     def __handle_boxset_library(self, service, library, title):
 
         include_types = 'BoxSet,Movie'
@@ -3373,46 +2369,46 @@ class MediaCoverGenerator(_PluginBase):
         parent_id = library_id
         boxsets = self.__get_items_batch(service, parent_id,
                                       include_types=include_types)
-        
+
         required_items = self.__get_required_items()
+        # 和普通媒体库一样多拉候选，打分后再选
+        pool_size = min(SELECTION_POOL_MAX, required_items * SELECTION_POOL_FACTOR)
         valid_items = []
-        
+
         # 首先检查BoxSet本身是否有合适的图片
         self._seen_keys = set()
 
         valid_boxsets = self.__filter_valid_items(boxsets)
         valid_items.extend(valid_boxsets)
-        
+
         # 如果BoxSet本身没有足够的图片，则获取其中的电影
-        if len(valid_items) < required_items:
+        if len(valid_items) < pool_size:
             for boxset in boxsets:
-                if len(valid_items) >= required_items:
+                if len(valid_items) >= pool_size:
                     break
-                    
+
                 # 获取此BoxSet中的电影
                 movies = self.__get_items_batch(service,
-                                             parent_id=boxset['Id'], 
+                                             parent_id=boxset['Id'],
                                              include_types=include_types)
-                
+
                 valid_movies = self.__filter_valid_items(movies)
                 valid_items.extend(valid_movies)
-                
-                if len(valid_items) >= required_items:
+
+                if len(valid_items) >= pool_size:
                     break
-        
+
         # 使用获取到的有效项目更新封面
         if len(valid_items) > 0:
-            if self.__is_single_image_style():
-                return self.__update_single_image(service, library, title, valid_items[0])
-            else:
-                return self.__update_grid_image(service, library, title, valid_items[:required_items])
+            chosen = self.__choose_items(service, library, valid_items[:pool_size], required_items, False)
+            return self.__update_grid_image(service, library, title, chosen)
         else:
-            print(f"媒体库 {service.name}：{library['Name']} 无法找到有效的图片项目")
+            logger.warning(f"媒体库 {service.name}：{library['Name']} 无法找到有效的图片项目")
             return False
-        
+
     def __handle_playlist_library(self, service, library, title):
-        """ 
-        播放列表图片获取 
+        """
+        播放列表图片获取
         """
         include_types = 'Playlist,Movie,Series,Episode,Audio'
         if service.type == 'emby':
@@ -3422,106 +2418,70 @@ class MediaCoverGenerator(_PluginBase):
         parent_id = library_id
         playlists = self.__get_items_batch(service, parent_id,
                                       include_types=include_types)
-        
+
         required_items = self.__get_required_items()
+        # 和普通媒体库一样多拉候选，打分后再选
+        pool_size = min(SELECTION_POOL_MAX, required_items * SELECTION_POOL_FACTOR)
         valid_items = []
-        
+
         # 首先检查 playlist 本身是否有合适的图片
         self._seen_keys = set()
 
         valid_playlists = self.__filter_valid_items(playlists)
         valid_items.extend(valid_playlists)
-        
+
         # 如果 playlist 本身没有足够的图片，则获取其中的电影
-        if len(valid_items) < required_items:
+        if len(valid_items) < pool_size:
             for playlist in playlists:
-                if len(valid_items) >= required_items:
+                if len(valid_items) >= pool_size:
                     break
-                    
+
                 # 获取此 playlist 中的电影
                 movies = self.__get_items_batch(service,
-                                             parent_id=playlist['Id'], 
+                                             parent_id=playlist['Id'],
                                              include_types=include_types)
-                
+
                 valid_movies = self.__filter_valid_items(movies)
                 valid_items.extend(valid_movies)
-                
-                if len(valid_items) >= required_items:
+
+                if len(valid_items) >= pool_size:
                     break
-        
+
         # 使用获取到的有效项目更新封面
         if len(valid_items) > 0:
-            if self.__is_single_image_style():
-                return self.__update_single_image(service, library, title, valid_items[0])
-            else:
-                return self.__update_grid_image(service, library, title, valid_items[:required_items])
+            chosen = self.__choose_items(service, library, valid_items[:pool_size], required_items, False)
+            return self.__update_grid_image(service, library, title, chosen)
         else:
-            print(f"警告: 无法为播放列表 {service.name}：{library['Name']} 找到有效的图片项目")
+            logger.warning(f"无法为播放列表 {service.name}：{library['Name']} 找到有效的图片项目")
             return False
-        
-    def __get_items_batch(self, service, parent_id, offset=0, limit=20, include_types=None, timeout=None):
-        """
-        调用媒体服务器 API 获取媒体项。
 
-        timeout: 单次请求超时（秒）。超时会快速失败并返回空列表，
-                 避免个别媒体库（如条目极多/API 响应缓慢的短剧库）拖死整个生成流程。
-        """
+    def __get_items_batch(self, service, parent_id, offset=0, limit=20, include_types=None):
+        # 调用API获取项目
         try:
             if not service:
                 return []
 
-            if timeout is None:
-                timeout = self.__get_request_timeout()
-
-            try:
-                if not self._sort_by:
-                    sort_by = 'Random'
-                else:
-                    sort_by = self._sort_by
-                if self._monitor_sort:
-                    sort_by = 'DateCreated'
-                    # 转移监控模式下强制包含 Episode 以获取最新入库的内容
+            sort_by = self._sort_by or 'Random'
+            if not include_types:
+                include_types = 'Movie,Series'
+            if self._monitor_sort:
+                sort_by = 'DateCreated'
+                # 入库更新时包含 Episode 以获取最新内容；音乐、合集、播放列表保持原有类型
+                if include_types in ('Movie,Series', 'Movie,Episode'):
                     include_types = 'Movie,Episode'
-                if not include_types:
-                    include_types = 'Movie,Series'
 
-                url = f'[HOST]emby/Items/?api_key=[APIKEY]' \
-                      f'&ParentId={parent_id}&SortBy={sort_by}&Limit={limit}' \
-                      f'&StartIndex={offset}&IncludeItemTypes={include_types}' \
-                      f'&Recursive=True&SortOrder=Descending'
+            url = f'[HOST]emby/Items/?api_key=[APIKEY]' \
+                  f'&ParentId={parent_id}&SortBy={sort_by}&Limit={limit}' \
+                  f'&StartIndex={offset}&IncludeItemTypes={include_types}' \
+                  f'&Recursive=True&SortOrder=Descending'
 
-                started = time.monotonic()
-                try:
-                    res = service.instance.get_data(url=url, timeout=timeout)
-                except TypeError:
-                    # 兼容不支持 timeout 参数的旧版客户端
-                    res = service.instance.get_data(url=url)
-
-                elapsed = time.monotonic() - started
-                if elapsed >= timeout:
-                    logger.warning(
-                        f"获取媒体项超时（>={timeout}s，实际 {elapsed:.1f}s），"
-                        f"parent_id={parent_id}，已跳过本批次"
-                    )
-                    return []
-
-                if res:
-                    data = res.json()
-                    return data.get("Items", [])
-            except Exception as err:
-                logger.error(f"获取媒体项失败：{str(err)}")
+            res = service.instance.get_data(url=url)
+            if res:
+                return res.json().get("Items", [])
             return []
-
         except Exception as err:
-            logger.error(f"Failed to get latest items: {str(err)}")
+            logger.error(f"获取媒体项失败：{str(err)}")
             return []
-
-    def __get_request_timeout(self) -> float:
-        """单次媒体服务器请求超时（秒），可通过配置项 request_timeout 调整。"""
-        try:
-            return max(5.0, min(120.0, float(self._request_timeout)))
-        except (TypeError, ValueError):
-            return 30.0
 
     def __filter_valid_items(self, items):
         """筛选有效的项目（包含所需图片的项目），并按图片标签去重"""
@@ -3596,479 +2556,333 @@ class MediaCoverGenerator(_PluginBase):
             return f"img:{image_url}"
 
 
-    
-    def __update_single_image(self, service, library, title, item):
-        """更新单图封面"""
-        logger.info(f"媒体库 {service.name}：{library['Name']} 从媒体项获取图片")
-        if not item:
-            logger.warning(f"媒体库 {service.name}：{library['Name']} 没有可用的媒体项，跳过")
-            return False
-        updated_item_id = ''
-        image_url = self.__get_image_url(item)
-        if not image_url:
-            logger.warning(f"媒体库 {service.name}：{library['Name']} 该媒体项没有可用图片，跳过")
-            return False
-            
-        image_path = self.__download_image(service, image_url, library['Name'], count=1)
-        if not image_path:
-            return False
-        updated_item_id = self.__get_item_id(item)
-        # 从配置获取背景颜色
-        title_result = self.__get_title_from_config(library['Name'])
-        config_bg_color = title_result[2] if len(title_result) == 3 else None
-        image_data = self.__generate_image_from_path(service.name, library['Name'], title, image_path, config_bg_color)
-            
-        if not image_data:
-            return False
-        if service.type == 'emby':
-            library_id = library.get("Id")
-        else:
-            library_id = library.get("ItemId")
-        # 更新id（item_id 为空时不做历史记录，避免污染去重逻辑）
-        if updated_item_id:
-            self.update_cover_history(
-                server=service.name, 
-                library_id=library_id, 
-                item_id=updated_item_id
-            )
 
-        return image_data
-    
     def __update_grid_image(self, service, library, title, items):
-        """更新九宫格封面"""
+        """下载素材并生成封面"""
         logger.info(f"媒体库 {service.name}：{library['Name']} 从媒体项获取图片")
 
-        image_paths = []
-        
-        updated_item_ids = []
-        for i, item in enumerate(items or []):
+        used_ids = []
+        count = 0
+        self.__clear_numbered_images(self.__library_work_dir(library['Name']))
+        for item in items:
             if self._event.is_set():
                 logger.info("检测到停止信号，中断图片下载 ...")
                 return False
-            image_url = self.__get_image_url(item)
-            if image_url:
-                image_path = self.__download_image(service, image_url, library['Name'], count=i+1)
-                if image_path:
-                    image_paths.append(image_path)
-                    item_id = self.__get_item_id(item)
-                    if item_id:
-                        updated_item_ids.append(item_id)
-        
-        if len(image_paths) < 1:
+            urls = self.__material_urls(item)
+            if not urls:
+                continue
+            number = count + 1
+            first = next((index for index, url in enumerate(urls)
+                          if self.__download_image(service, url, library['Name'], count=number)), None)
+            if first is None:
+                continue
+            count = number
+            # 另一种比例的图只是锦上添花，下载失败不影响这个条目
+            for url in urls[first + 1:]:
+                if self.__download_image(service, url, library['Name'], count=number, alt=True, retries=1):
+                    break
+            item_id = self.__get_item_id(item)
+            if item_id:
+                used_ids.append(item_id)
+
+        if count < 1:
+            self._failure_reason = "素材图片下载失败，请检查媒体服务器的连接"
             return False
-            
-        # 生成九宫格图片
-        # 从配置获取背景颜色
+
+        # 从配置获取点缀色
         title_result = self.__get_title_from_config(library['Name'])
         config_bg_color = title_result[2] if len(title_result) == 3 else None
-        image_data = self.__generate_image_from_path(service.name, library['Name'], title, None, config_bg_color)
+        image_data = self.__generate_cover(service.name, library['Name'], title, config_bg_color)
         if not image_data:
             return False
-        if service.type == 'emby':
-            library_id = library.get("Id")
-        else:
-            library_id = library.get("ItemId")
-        # 更新ids
-        for item_id in reversed(updated_item_ids):
-            self.update_cover_history(
-                server=service.name, 
-                library_id=library_id, 
-                item_id=item_id
-            )
-            
+        # 预览只是看效果，不算这些图用过
+        self._pending_history = [] if self._preview_mode else used_ids
         return image_data
-    
+
     def __load_title_config(self, yaml_str: str) -> dict:
         try:
-            # 替换全角冒号为半角
-            yaml_str = yaml_str.replace("：", ":")
+            # 先处理转义换行，再处理真实换行
+            yaml_str = yaml_str.replace('\\r\\n', '\n')
+            yaml_str = yaml_str.replace('\\r', '\n')
+            yaml_str = yaml_str.replace('\\n', '\n')
+            yaml_str = yaml_str.replace('\r\n', '\n')
+            yaml_str = yaml_str.replace('\r', '\n')
             # 替换制表符为两个空格，统一缩进
             yaml_str = yaml_str.replace("\t", "  ")
 
-            # 处理数字或字母开头的媒体库名，确保它们被正确解析为字符串键
-            # 在YAML中，数字开头的键可能被解析为数字，需要加引号
-            lines = yaml_str.split('\n')
+            # 只调整顶格的「媒体库名:」行。列表项里的标题可以包含冒号，不能当作键处理
             processed_lines = []
-            for line in lines:
-                # 检查是否是键值对行（包含冒号且不是注释）
-                if ':' in line and not line.strip().startswith('#'):
-                    # 分割键和值
-                    parts = line.split(':', 1)
-                    if len(parts) == 2:
-                        key_part = parts[0].strip()
-                        value_part = parts[1]
+            for line in yaml_str.split('\n'):
+                if line and not line[0].isspace() and not line.startswith(('#', '-')):
+                    normalized = line.replace("：", ":", 1) if ":" not in line else line
+                    key_part, separator, value_part = normalized.partition(':')
+                    key_part = key_part.strip()
+                    if separator and key_part and key_part[0] not in "\"'":
+                        # 数字开头或含特殊字符的媒体库名加引号，确保被解析为字符串
+                        if key_part[0].isdigit() or any(char in key_part for char in " -.()[]"):
+                            key_part = json.dumps(key_part, ensure_ascii=False)
+                        line = f"{key_part}:{value_part}"
+                processed_lines.append(line)
 
-                        # 如果键不是以引号开头，且包含数字或特殊字符，则添加引号
-                        if key_part and not (key_part.startswith('"') or key_part.startswith("'")):
-                            # 检查是否需要加引号（数字开头、包含特殊字符等）
-                            if (key_part[0].isdigit() or
-                                any(char in key_part for char in [' ', '-', '.', '(', ')', '[', ']'])):
-                                key_part = f'"{key_part}"'
-
-                        processed_lines.append(f"{key_part}:{value_part}")
-                    else:
-                        processed_lines.append(line)
-                else:
-                    processed_lines.append(line)
-
-            processed_yaml = '\n'.join(processed_lines)
-            preview_limit = 800
-            flat_yaml = " ".join(part.strip() for part in processed_yaml.splitlines() if part.strip())
-            if len(flat_yaml) > preview_limit:
-                logger.debug(f"处理后的YAML(扁平, 前{preview_limit}字): {flat_yaml[:preview_limit]}... (已截断)")
-            else:
-                logger.debug(f"处理后的YAML(扁平): {flat_yaml}")
-
-            title_config = yaml.safe_load(processed_yaml) or {}
+            title_config = yaml.safe_load('\n'.join(processed_lines)) or {}
             if not isinstance(title_config, dict):
+                self._title_config_error = "标题配置应为「媒体库名称: 标题列表」的形式"
                 return {}
             filtered = {}
             for key, value in title_config.items():
-                if isinstance(value, list) and len(value) >= 2 and isinstance(value[0], str) and isinstance(value[1], str):
-                    # 支持两行或三行配置（第三行可选）
-                    if len(value) >= 3 and isinstance(value[2], str):
-                        filtered[str(key)] = [value[0], value[1], value[2]]
-                    else:
-                        filtered[str(key)] = [value[0], value[1]]
+                if isinstance(value, list) and len(value) >= 2:
+                    # YAML 会把纯数字解析为数字，这里统一转成字符串
+                    texts = ["" if part is None else str(part) for part in value[:3]]
+                    filtered[str(key)] = texts
                     if len(value) > 3:
                         logger.info(f"配置项 {key} 包含多行，只使用前三行")
                 else:
-                    # 忽略格式不正确的项
                     logger.warning(f"标题配置项格式不正确，已忽略: {key} -> {value}")
-                    continue
-
-            logger.debug(f"解析后的配置: {filtered}")
+            self._title_config_error = ""
             return filtered
         except Exception as e:
             # 整体 YAML 无法解析（比如语法错误），返回空配置
             logger.warning(f"YAML 解析失败，使用空配置: {e}")
+            self._title_config_error = str(e).split("\n")[0]
             return {}
 
     def __get_title_from_config(self, library_name):
         """
         从 yaml 配置中获取媒体库的主副标题和背景颜色
         """
-        zh_title = library_name
-        en_title = ''
-        bg_color = None
-        title_config = {}
-        if self._current_config:
-            title_config = self._current_config
-        elif self._title_config:
-            title_config = self.__load_title_config(self._title_config)
+        title_config = self.__load_title_config(self._title_config) if self._title_config else {}
+        target = str(library_name).strip()
+        match = title_config.get(str(library_name))
+        if match is None:
+            for name, values in title_config.items():
+                if name.strip().lower() == target.lower():
+                    match = values
+                    break
+        if match is None:
+            return library_name, '', None
+        return (
+            match[0] or library_name,
+            match[1] if len(match) > 1 else '',
+            match[2] if len(match) > 2 and match[2] else None,
+        )
 
-        # 添加调试信息
-        logger.debug(f"查找媒体库名称: '{library_name}' (类型: {type(library_name)})")
-        logger.debug(f"可用的配置键: {list(title_config.keys())}")
-
-        # 多种匹配策略，确保数字或字母开头的媒体库名能够正确匹配
-        for lib_name, config_values in title_config.items():
-            # 策略1: 直接字符串比较
-            if str(lib_name) == str(library_name):
-                zh_title = config_values[0]
-                en_title = config_values[1] if len(config_values) > 1 else ''
-                bg_color = config_values[2] if len(config_values) > 2 else None
-                logger.debug(f"找到匹配的配置(直接匹配): {lib_name} -> {zh_title}, {en_title}, {bg_color}")
-                break
-
-            # 策略2: 去除空格后比较
-            if str(lib_name).strip() == str(library_name).strip():
-                zh_title = config_values[0]
-                en_title = config_values[1] if len(config_values) > 1 else ''
-                bg_color = config_values[2] if len(config_values) > 2 else None
-                logger.debug(f"找到匹配的配置(去空格匹配): {lib_name} -> {zh_title}, {en_title}, {bg_color}")
-                break
-
-            # 策略3: 忽略大小写比较
-            if str(lib_name).lower() == str(library_name).lower():
-                zh_title = config_values[0]
-                en_title = config_values[1] if len(config_values) > 1 else ''
-                bg_color = config_values[2] if len(config_values) > 2 else None
-                logger.debug(f"找到匹配的配置(忽略大小写匹配): {lib_name} -> {zh_title}, {en_title}, {bg_color}")
-                break
-        else:
-            logger.debug(f"未找到媒体库 '{library_name}' 的配置，使用默认标题")
-            # 如果没有找到配置，检查是否是数字开头的媒体库名导致的问题
-            if library_name and (library_name[0].isdigit() or library_name[0].isalpha()):
-                logger.info(f"媒体库名 '{library_name}' 以数字或字母开头，如果需要自定义标题，请在配置中使用引号包围媒体库名，例如: \"{library_name}\":")
-
-        return (zh_title, en_title, bg_color)
-    
     def __get_server_libraries(self, service):
-        try:
-            if not service:
-                return []
-            try:
-                if service.type == 'emby':
-                    url = f'[HOST]emby/Library/VirtualFolders/Query?api_key=[APIKEY]'
-                else:
-                    url = f'[HOST]emby/Library/VirtualFolders/?api_key=[APIKEY]'
-                res = service.instance.get_data(url=url)
-                if res:
-                    data = res.json()
-                    if service.type == 'emby':
-                        return data.get("Items", [])
-                    else:
-                        return data
-            except Exception as err:
-                logger.error(f"获取媒体库列表失败：{str(err)}")
+        if not service:
             return []
+        libraries = []
+        try:
+            if service.type == 'emby':
+                url = f'[HOST]emby/Library/VirtualFolders/Query?api_key=[APIKEY]'
+            else:
+                url = f'[HOST]emby/Library/VirtualFolders/?api_key=[APIKEY]'
+            res = service.instance.get_data(url=url)
+            if res:
+                data = res.json()
+                libraries = data.get("Items", []) if service.type == 'emby' else data
         except Exception as err:
             logger.error(f"获取媒体库列表失败：{str(err)}")
+        return [*libraries, *self.__get_live_tv_views(service, libraries)]
+
+    def __get_live_tv_views(self, service, libraries) -> List[Dict[str, Any]]:
+        """电视直播不是虚拟文件夹，VirtualFolders 接口查不到，要从用户视图里补上。"""
+        try:
+            res = service.instance.get_data(url='[HOST]emby/Users/[USER]/Views?api_key=[APIKEY]')
+            if not res:
+                return []
+            known_ids = {str(library.get("Id") or library.get("ItemId")) for library in libraries}
+            views = []
+            for item in res.json().get("Items", []):
+                item_id = item.get("Id")
+                if item.get("CollectionType") != LIVE_TV_TYPE or not item_id or str(item_id) in known_ids:
+                    continue
+                views.append({
+                    "Name": item.get("Name") or "电视直播",
+                    "Id": item_id,
+                    "ItemId": item_id,
+                    "CollectionType": LIVE_TV_TYPE,
+                    "Locations": [],
+                })
+            return views
+        except Exception as err:
+            # 视图只用于补充电视直播，失败时不影响普通媒体库
+            logger.debug(f"获取电视直播视图失败：{str(err)}")
             return []
-    
+
+    @staticmethod
+    def __normalize_library_path(path):
+        """Normalize Emby paths so UNC and local path representations can match."""
+        if path is None:
+            return ""
+
+        normalized = str(path).strip().replace("\\", "/")
+        if normalized.startswith("//"):
+            # Emby may return //server/share/... while VirtualFolders uses /share/...
+            unc_parts = [part for part in normalized[2:].split("/") if part]
+            normalized = "/" + "/".join(unc_parts[1:]) if len(unc_parts) > 1 else "/"
+
+        normalized = re.sub(r"/+", "/", normalized)
+        if len(normalized) > 1:
+            normalized = normalized.rstrip("/")
+        return normalized
+
+    @classmethod
+    def __path_is_under(cls, item_path, library_path):
+        """Return whether an item belongs to a library directory."""
+        item_path = cls.__normalize_library_path(item_path)
+        library_path = cls.__normalize_library_path(library_path)
+        if not item_path or not library_path:
+            return False
+        return item_path == library_path or item_path.startswith(library_path + "/")
+
     def __get_all_libraries(self, server, service):
         try:
             lib_items = []
             libraries = self.__get_server_libraries(service)
-            for library in libraries or []:
-                if not isinstance(library, dict):
-                    continue
+            for library in libraries:
                 if service.type == 'emby':
                     library_id = library.get("Id")
                 else:
                     library_id = library.get("ItemId")
-                library_name = library.get("Name")
-                if library_name and library_id:
+                if library['Name'] and library_id:
                     lib_item = {
-                        "name": f"{server}: {library_name}",
-                        "value": f"{server}-{library_id}"
+                        "name": f"{server}: {library['Name']}",
+                        "value": f"{server}-{library_id}",
+                        "server": server,
+                        "library": library['Name'],
+                        "type": library.get("CollectionType") or "",
                     }
                     lib_items.append(lib_item)
             return lib_items
         except Exception as err:
             logger.error(f"获取所有媒体库失败：{str(err)}")
             return []
-        
+
+    @staticmethod
+    def __image_sets(item) -> Tuple[List[Tuple[Any, str, Any]], List[Tuple[Any, str, Any]]]:
+        """条目可用的图片：(竖版海报, 横版图)，每项是 (条目 ID, 图片路径, tag)，按优先级排列。"""
+        item_type = item.get("Type")
+        parent_tags = item.get("ParentBackdropImageTags") or []
+        own_backdrops = item.get("BackdropImageTags") or []
+        image_tags = item.get("ImageTags") or {}
+
+        own_primary = (item.get("Id"), "Primary", image_tags.get("Primary"))
+        series_primary = (item.get("SeriesId"), "Primary", item.get("SeriesPrimaryImageTag"))
+        wide = [
+            (item.get("Id"), "Backdrop/0", own_backdrops[0] if own_backdrops else None),
+            (item.get("ParentBackdropItemId"), "Backdrop/0", parent_tags[0] if parent_tags else None),
+            # 有些条目没有背景图，只有 16:9 的缩略图
+            (item.get("Id"), "Thumb", image_tags.get("Thumb")),
+            (item.get("ParentThumbItemId"), "Thumb", item.get("ParentThumbImageTag")),
+            (item.get("SeriesId"), "Thumb", item.get("SeriesThumbImageTag")),
+        ]
+        if item_type in ("MusicAlbum", "Audio"):
+            tall = [
+                (item.get("PrimaryImageItemId"), "Primary", item.get("PrimaryImageTag")),
+                (item.get("AlbumId"), "Primary", item.get("AlbumPrimaryImageTag")),
+                own_primary,
+            ]
+        elif item_type == "Episode":
+            # 单集的 Primary 是 16:9 的剧照，算横版图；竖版海报要用整部剧的
+            tall = [series_primary]
+            wide.append(own_primary)
+        else:
+            tall = [own_primary]
+
+        def usable(candidates):
+            return [candidate for candidate in candidates if candidate[0] and candidate[2]]
+
+        return usable(tall), usable(wide)
+
+    def __image_candidates(self, item) -> List[Tuple[Any, str, Any]]:
+        """按首选顺序列出条目的图片：(条目 ID, 图片路径, tag)。"""
+        tall, wide = self.__image_sets(item)
+        return [*tall, *wide] if self.__prefer_primary() else [*wide, *tall]
+
+    @staticmethod
+    def __image_url(candidate: Tuple[Any, str, Any], sized: bool = False) -> str:
+        item_id, image_path, tag = candidate
+        url = f'[HOST]emby/Items/{item_id}/Images/{image_path}?tag={tag}&api_key=[APIKEY]'
+        if sized:
+            url += f'&maxWidth={MATERIAL_MAX_SIZE}&maxHeight={MATERIAL_MAX_SIZE}'
+        return url
+
     def __get_image_url(self, item):
         """
         从媒体项信息中获取图片URL
-
-        说明：本函数只在命中图片分支时返回，未命中任何分支时返回 None。
-        调用方必须对 None 做判空处理，不能假定一定有返回值。
         """
-        if not item:
-            return None
-        # Emby/Jellyfin
-        if item['Type'] in 'MusicAlbum,Audio':
-            if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                item_id = item.get("ParentBackdropItemId")
-                tag = item["ParentBackdropImageTags"][0]
-                return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-            elif item.get("PrimaryImageTag"):
-                item_id = item.get("PrimaryImageItemId")
-                tag = item.get("PrimaryImageTag")
-                return f'[HOST]emby/Items/{item_id}/Images/Primary?tag={tag}&api_key=[APIKEY]'
-            elif item.get("AlbumPrimaryImageTag"):
-                item_id = item.get("AlbumId")
-                tag = item.get("AlbumPrimaryImageTag")
-                return f'[HOST]emby/Items/{item_id}/Images/Primary?tag={tag}&api_key=[APIKEY]'
+        candidates = self.__image_candidates(item)
+        return self.__image_url(candidates[0]) if candidates else None
 
-        elif self._cover_style == 'static_3' or self._cover_style in ['animated_1', 'animated_2', 'animated_3', 'animated_4']:
-            if self._use_primary:
-                if item.get("Type") == 'Episode':
-                    if item.get("SeriesPrimaryImageTag"):
-                        item_id = item.get("SeriesId")
-                        tag = item.get("SeriesPrimaryImageTag")
-                        return f'[HOST]emby/Items/{item_id}/Images/Primary?tag={tag}&api_key=[APIKEY]'
-                    elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                        item_id = item.get("ParentBackdropItemId")
-                        tag = item["ParentBackdropImageTags"][0]
-                        return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-                elif item.get("ImageTags") and item.get("ImageTags").get("Primary"):
-                    item_id = item.get("Id")
-                    tag = item.get("ImageTags").get("Primary")
-                    return f'[HOST]emby/Items/{item_id}/Images/Primary?tag={tag}&api_key=[APIKEY]'
-                elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                    item_id = item.get("ParentBackdropItemId")
-                    tag = item["ParentBackdropImageTags"][0]
-                    return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-                elif item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0:
-                    item_id = item.get("Id")
-                    tag = item["BackdropImageTags"][0]
-                    return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-            else:
-                if item.get("Type") == 'Episode':
-                    if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                        item_id = item.get("ParentBackdropItemId")
-                        tag = item["ParentBackdropImageTags"][0]
-                        return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-                    elif item.get("SeriesPrimaryImageTag"):
-                        item_id = item.get("SeriesId")
-                        tag = item.get("SeriesPrimaryImageTag")
-                        return f'[HOST]emby/Items/{item_id}/Images/Primary?tag={tag}&api_key=[APIKEY]'
-                if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                    item_id = item.get("ParentBackdropItemId")
-                    tag = item["ParentBackdropImageTags"][0]
-                    return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-                elif item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0:
-                    item_id = item.get("Id")
-                    tag = item["BackdropImageTags"][0]
-                    return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-                elif item.get("ImageTags") and item.get("ImageTags").get("Primary"):
-                    item_id = item.get("Id")
-                    tag = item.get("ImageTags").get("Primary")
-                    return f'[HOST]emby/Items/{item_id}/Images/Primary?tag={tag}&api_key=[APIKEY]'
+    def __material_urls(self, item) -> List[str]:
+        """
+        这个条目要下载的图。第一张可用的是首选图，之后第一张可用的是另一种比例的备用图。
+        用户指定只用海报或只用背景图时，只有另一种完全没有才用。
+        """
+        tall, wide = self.__image_sets(item)
+        if self._use_primary in (None, "", "auto"):
+            first, second = (tall, wide) if self.__prefer_primary() else (wide, tall)
+            # 备用图要是另一种比例：首选图都下载失败时才轮到同类的下一张
+            ordered = [*first[:1], *second[:1], *first[1:], *second[1:]]
+        elif self._use_primary:
+            ordered = tall or wide
+        else:
+            ordered = wide or tall
+        return [self.__image_url(candidate, sized=True) for candidate in ordered]
 
-        elif self._cover_style.startswith('static'):
-            if self._use_primary:
-                if item.get("Type") == 'Episode':
-                    if item.get("SeriesPrimaryImageTag"):
-                        item_id = item.get("SeriesId")
-                        tag = item.get("SeriesPrimaryImageTag")
-                        return f'[HOST]emby/Items/{item_id}/Images/Primary?tag={tag}&api_key=[APIKEY]'
-                    elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                        item_id = item.get("ParentBackdropItemId")
-                        tag = item["ParentBackdropImageTags"][0]
-                        return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-                elif item.get("ImageTags") and item.get("ImageTags").get("Primary"):
-                    item_id = item.get("Id")
-                    tag = item.get("ImageTags").get("Primary")
-                    return f'[HOST]emby/Items/{item_id}/Images/Primary?tag={tag}&api_key=[APIKEY]'
-                elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                    item_id = item.get("ParentBackdropItemId")
-                    tag = item["ParentBackdropImageTags"][0]
-                    return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-                elif item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0:
-                    item_id = item.get("Id")
-                    tag = item["BackdropImageTags"][0]
-                    return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-            else:
-                if item.get("Type") == 'Episode':
-                    if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                        item_id = item.get("ParentBackdropItemId")
-                        tag = item["ParentBackdropImageTags"][0]
-                        return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-                    elif item.get("SeriesPrimaryImageTag"):
-                        item_id = item.get("SeriesId")
-                        tag = item.get("SeriesPrimaryImageTag")
-                        return f'[HOST]emby/Items/{item_id}/Images/Primary?tag={tag}&api_key=[APIKEY]'
-                elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                    item_id = item.get("ParentBackdropItemId")
-                    tag = item["ParentBackdropImageTags"][0]
-                    return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-                elif item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0:
-                    item_id = item.get("Id")
-                    tag = item["BackdropImageTags"][0]
-                    return f'[HOST]emby/Items/{item_id}/Images/Backdrop/0?tag={tag}&api_key=[APIKEY]'
-                elif item.get("ImageTags") and item.get("ImageTags").get("Primary"):
-                    item_id = item.get("Id")
-                    tag = item.get("ImageTags").get("Primary")
-                    return f'[HOST]emby/Items/{item_id}/Images/Primary?tag={tag}&api_key=[APIKEY]'
-            
     def __get_item_id(self, item):
         """
         从媒体项信息中获取项目ID
-
-        注意：本函数曾经因为分支未命中导致 UnboundLocalError
-        （cannot access local variable 'item_id' where it is not associated with a value）。
-        这里统一改为在任何分支前先赋值兜底，并保证任何路径都有返回值。
         """
-        if not item:
-            return ''
+        candidates = self.__image_candidates(item)
+        return candidates[0][0] if candidates else None
 
-        # 兜底：默认使用自身 Id，保证后续任何分支都不会出现未绑定变量
-        item_id = item.get("Id")
-
-        # Emby/Jellyfin
-        if item.get('Type') in 'MusicAlbum,Audio':
-            if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                item_id = item.get("ParentBackdropItemId")
-            elif item.get("PrimaryImageTag"):
-                item_id = item.get("PrimaryImageItemId")
-            elif item.get("AlbumPrimaryImageTag"):
-                item_id = item.get("AlbumId")
-
-        elif self._cover_style == 'static_3' or self._cover_style in ['animated_1', 'animated_2', 'animated_3', 'animated_4']:
-            if self._use_primary:
-                if (item.get("ImageTags") and item.get("ImageTags").get("Primary")) \
-                    or (item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0):
-                    item_id = item.get("Id")
-                elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                    item_id = item.get("ParentBackdropItemId")
-            else:
-                if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                    item_id = item.get("ParentBackdropItemId")
-                elif (item.get("ImageTags") and item.get("ImageTags").get("Primary")) \
-                    or (item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0):
-                    item_id = item.get("Id")
-
-        elif self._cover_style.startswith('static'):
-            if self._use_primary:
-                if (item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0) \
-                    or (item.get("ImageTags") and item.get("ImageTags").get("Primary")):
-                    item_id = item.get("Id")
-                elif item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                    item_id = item.get("ParentBackdropItemId")
-            else:
-                if item.get("ParentBackdropImageTags") and len(item["ParentBackdropImageTags"]) > 0:
-                    item_id = item.get("ParentBackdropItemId")
-                elif (item.get("BackdropImageTags") and len(item["BackdropImageTags"]) > 0) \
-                    or (item.get("ImageTags") and item.get("ImageTags").get("Primary")):
-                    item_id = item.get("Id")
-
-        return item_id
-
-    def __download_image(self, service, imageurl, library_name, count=None, retries=3, delay=1):
+    def __download_image(self, service, imageurl, library_name, count=None, retries=3, delay=1, alt=False):
         """
-        下载图片，保存到本地目录 self._covers_path/library_name/ 下，文件名为 1-9.jpg
-        若已存在则跳过下载，直接返回图片路径。
-        下载失败时重试若干次。
+        下载图片到 self._covers_path/library_name/，文件名为 {count}.jpg，备用图为 {count}.alt.jpg。
+        只有通过校验的图片才会落盘，媒体服务器返回错误页时不会污染素材目录。
         """
         try:
-            # 确保媒体库名称是安全的文件名（处理数字或字母开头的名称）
-            safe_library_name = self.__sanitize_filename(library_name)
+            subdir = self.__library_work_dir(library_name)
+            subdir.mkdir(parents=True, exist_ok=True)
+            suffix = ALT_SUFFIX if alt else ""
+            filename = f"{count}{suffix}.jpg" if count is not None else f"img_{int(time.time())}.jpg"
+            filepath = subdir / filename
+            temp_path = subdir / f"{filename}.part"
 
-            # 创建目标子目录
-            subdir = os.path.join(self._covers_path, safe_library_name)
-            os.makedirs(subdir, exist_ok=True)
-
-            # 文件命名：item_id 为主，适合排序
-            if count is not None:
-                filename = f"{count}.jpg"
-            else:
-                filename = f"img_{int(time.time())}.jpg"
-
-            filepath = os.path.join(subdir, filename)
-
-            # 如果文件已存在，直接返回路径
-            # if os.path.exists(filepath):
-            #     return filepath
-
-            # 重试机制
             for attempt in range(1, retries + 1):
-                image_content = None
-
                 if '[HOST]' in imageurl:
                     if not service:
                         return None
-
-                    r = service.instance.get_data(url=imageurl)
-                    if r and r.status_code == 200:
-                        image_content = r.content
+                    response = service.instance.get_data(url=imageurl)
                 else:
-                    r = RequestUtils().get_res(url=imageurl)
-                    if r and r.status_code == 200:
-                        image_content = r.content
+                    response = RequestUtils().get_res(url=imageurl)
 
-                # 如果成功，保存并返回
-                if image_content:
-                    with open(filepath, 'wb') as f:
-                        f.write(image_content)
-                    return filepath
+                if response is not None and response.status_code == 200 and response.content:
+                    temp_path.write_bytes(response.content)
+                    try:
+                        with Image.open(temp_path) as image:
+                            image.verify()
+                        temp_path.replace(filepath)
+                        return str(filepath)
+                    except Exception as error:
+                        logger.warning(f"下载到的图片无法解析：{error}")
+                        temp_path.unlink(missing_ok=True)
 
-                # 如果失败，记录并等待后重试
-                logger.warning(f"第 {attempt} 次尝试下载失败：{imageurl}")
                 if attempt < retries:
+                    logger.warning(f"第 {attempt} 次尝试下载失败：{self.__loggable_url(imageurl)}")
                     time.sleep(delay)
 
-            logger.error(f"图片下载失败（重试 {retries} 次）：{imageurl}")
+            logger.warning(f"图片下载失败（尝试 {retries} 次）：{self.__loggable_url(imageurl)}")
             return None
 
         except Exception as err:
             logger.error(f"下载图片异常：{str(err)}")
             return None
 
+    @staticmethod
+    def __loggable_url(url: str) -> str:
+        """日志里不写密钥。"""
+        return re.sub(r"(api_key=)[^&]*", r"\1***", str(url))
 
     def __save_image_to_local(self, image_content, server_name: str, library_name: str, extension: str):
         """
@@ -4078,24 +2892,21 @@ class MediaCoverGenerator(_PluginBase):
             if not self._save_recent_covers:
                 return
             # 确保目录存在
-            local_path = str(self.__get_recent_cover_output_dir())
-            os.makedirs(local_path, exist_ok=True)
+            local_path = self.__get_recent_cover_output_dir()
+            local_path.mkdir(parents=True, exist_ok=True)
 
-            safe_server = self.__sanitize_filename(server_name) or "server"
             safe_library = self.__sanitize_filename(library_name) or "library"
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = datetime.datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
             ext = extension.strip(".").lower() if extension else "jpg"
-            filename = f"{safe_server}_{safe_library}_{timestamp}.{ext}"
-
-            file_path = os.path.join(local_path, filename)
-            with open(file_path, "wb") as f:
-                f.write(image_content)
+            file_path = local_path / f"{timestamp}__{safe_library}.{ext}"
+            file_path.write_bytes(image_content)
             logger.info(f"图片已保存到本地: {file_path}")
-            self.__trim_saved_cover_history(local_path, safe_server, safe_library)
+            self.__trim_saved_cover_history(local_path)
         except Exception as err:
             logger.error(f"保存图片到本地失败: {str(err)}")
 
-    def __trim_saved_cover_history(self, local_path: str, safe_server: str, safe_library: str):
+    def __trim_saved_cover_history(self, local_path: Path):
+        """按媒体库分别保留最新的若干张，只处理插件生成的文件。"""
         limit = self.__clamp_value(
             self._covers_history_limit_per_library,
             1,
@@ -4104,27 +2915,22 @@ class MediaCoverGenerator(_PluginBase):
             "covers_history_limit_per_library[trim]",
             int,
         )
-        pattern = f"{safe_server}_{safe_library}_"
-        candidate_files: List[Path] = []
+        grouped: Dict[str, List[Path]] = defaultdict(list)
         try:
-            for file_name in os.listdir(local_path):
-                lower_name = file_name.lower()
-                if not lower_name.endswith((".jpg", ".jpeg", ".png", ".gif", ".webp", ".apng")):
+            for file_path in Path(local_path).iterdir():
+                match = COVER_NAME_PATTERN.match(file_path.name)
+                if match and file_path.is_file():
+                    grouped[match.group(7) or ""].append(file_path)
+            for files in grouped.values():
+                if len(files) <= limit:
                     continue
-                if not file_name.startswith(pattern):
-                    continue
-                file_path = Path(local_path) / file_name
-                if file_path.is_file():
-                    candidate_files.append(file_path)
-            if len(candidate_files) <= limit:
-                return
-            candidate_files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-            for old_file in candidate_files[limit:]:
-                old_file.unlink(missing_ok=True)
-                logger.info(f"已按历史数量限制删除旧封面: {old_file}")
+                files.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+                for old_file in files[limit:]:
+                    old_file.unlink(missing_ok=True)
+                    logger.info(f"已按历史数量限制删除旧封面: {old_file}")
         except Exception as e:
             logger.warning(f"清理历史封面失败: {e}")
-        
+
 
     def __set_library_image(self, service, library, image_base64):
         """
@@ -4137,13 +2943,15 @@ class MediaCoverGenerator(_PluginBase):
                 library_id = library.get("Id")
             else:
                 library_id = library.get("ItemId")
-            
+
             url = f'[HOST]emby/Items/{library_id}/Images/Primary?api_key=[APIKEY]'
             # 根据 base64 前几个字节简单判断格式
             content_type = "image/png"
             extension = "png"
             if image_base64.startswith("R0lG"):
-                content_type = "image/gif"
+                # Emby 只把存储的 GIF 发给 Accept 明确接受 GIF 的请求，其余都压成单帧 PNG。
+                # 标成 PNG 后存为 poster.png，无需缩小时 Emby 原样返回这份 GIF 数据
+                content_type = "image/png" if service.type == "emby" else "image/gif"
                 extension = "gif"
             elif image_base64.startswith("UklG"):
                 content_type = "image/webp"
@@ -4162,7 +2970,7 @@ class MediaCoverGenerator(_PluginBase):
                     self.__save_image_to_local(image_bytes, service.name, library['Name'], extension)
                 except Exception as save_err:
                     logger.error(f"保存发送前图片失败: {str(save_err)}")
-            
+
             res = service.instance.post_data(
                 url=url,
                 data=image_base64,
@@ -4170,13 +2978,16 @@ class MediaCoverGenerator(_PluginBase):
                     "Content-Type": content_type
                 }
             )
-            
+
             if res and res.status_code in [200, 204]:
                 return True
             else:
-                logger.error(f"设置「{library['Name']}」封面失败，错误码：{res.status_code if res else 'No response'}")
+                status_code = res.status_code if res is not None else '无响应'
+                self._failure_reason = f"媒体服务器拒绝了封面上传（{status_code}）"
+                logger.error(f"设置「{library['Name']}」封面失败，错误码：{status_code}")
                 return False
         except Exception as err:
+            self._failure_reason = f"上传封面时出错：{err}"
             logger.error(f"设置「{library['Name']}」封面失败：{str(err)}")
         return False
 
@@ -4215,15 +3026,11 @@ class MediaCoverGenerator(_PluginBase):
             "timestamp": now
         }
 
-        # 原始数据
-        history = self.get_data('cover_history') or []
-
-        # 用于分组管理：(server, library_id) => list of items
+        # 用于分组管理：(server, library_id) => list of items；跳过字段不完整的旧记录
         grouped = defaultdict(list)
-        for item in history:
-            key = (item["server"], str(item["library_id"]))
+        for item in self.clean_cover_history(save=False):
+            key = (item["server"], item["library_id"])
             grouped[key].append(item)
-
         key = (server, library_id)
         items = grouped[key]
 
@@ -4248,274 +3055,105 @@ class MediaCoverGenerator(_PluginBase):
             new_history.extend(item_list)
 
         self.save_data('cover_history', new_history)
-        return [ 
+        return [
             item for item in new_history
             if str(item.get("library_id")) == str(library_id)
         ]
 
-    def prepare_library_images(self, library_dir: str, required_items: int = 9):
-        """
-        准备目录下的 1~required_items.jpg 图片文件:
-        1. 检查已有的目标编号文件
-        2. 保留已有的文件，只补足缺失的编号
-        3. 补充文件时尽量避免连续使用相同的源图片
-        """
-        os.makedirs(library_dir, exist_ok=True)
+    @staticmethod
+    def __has_material(library_dir: Path) -> bool:
+        """目录里有没有能用的图。数量不够没关系，风格会循环使用已有的图。"""
+        library_dir = Path(library_dir)
+        return library_dir.is_dir() and any(
+            entry.is_file() and entry.suffix.lower() in IMAGE_EXTENSIONS for entry in library_dir.iterdir())
 
-        required_items = max(1, int(required_items))
-
-        # 检查哪些编号的文件已存在，哪些缺失
-        existing_numbers = []
-        missing_numbers = []
-        for i in range(1, required_items + 1):
-            target_file_path = os.path.join(library_dir, f"{i}.jpg")
-            if os.path.exists(target_file_path):
-                existing_numbers.append(i)
-            else:
-                missing_numbers.append(i)
-
-        # 如果已经存在所有文件，直接返回
-        if not missing_numbers:
-            return True
-
-        logger.info(f"信息: {library_dir} 中缺少以下编号的图片: {missing_numbers}，将进行补充。")
-
-        target_name_pattern = rf"^[1-9][0-9]*\.jpg$"
-
-        # 获取可用作源的图片（排除已有的目标编号文件）
-        # 使用 scandir 并限制采样数量，避免超大目录扫描导致长时间无日志
-        source_image_filenames = []
-        max_source_scan = 512
-        scanned_entries = 0
-        for entry in os.scandir(library_dir):
-            scanned_entries += 1
-            if not entry.is_file():
-                continue
-
-            f = entry.name
-            # 排除 N.jpg（N 为正整数）作为源
-            if re.match(target_name_pattern, f, re.IGNORECASE):
-                continue
-            if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-                source_image_filenames.append(f)
-                if len(source_image_filenames) >= max_source_scan:
-                    break
-
-        if scanned_entries > 2000:
-            logger.info(f"信息: {library_dir} 文件较多，已快速采样 {len(source_image_filenames)} 张作为补图源")
-
-        # 如果没有源图片可用
-        if not source_image_filenames:
-            # 如果已经有部分目标编号图片，可以从这些现有文件中选择
-            if existing_numbers:
-                logger.info(f"信息: {library_dir} 中没有其他图片可用，将从现有目标编号图片中随机选择进行复制。")
-                existing_file_paths = [os.path.join(library_dir, f"{i}.jpg") for i in existing_numbers]
-                source_image_paths = existing_file_paths
-            else:
-                logger.info(f"警告: {library_dir} 中没有任何可用的图片来生成 1-{required_items}.jpg。")
-                return False
-        else:
-            # 将文件名转换为完整路径
-            source_image_paths = [os.path.join(library_dir, f) for f in sorted(source_image_filenames)]
-
-        # 如果源图片数量不足，需要重复使用
-        if len(source_image_paths) < len(missing_numbers):
-            logger.info(f"信息: 源图片数量({len(source_image_paths)})小于缺失数量({len(missing_numbers)})，某些图片将被重复使用。")
-        
-        # 为每个缺失的编号选择一个源图片，尽量避免连续重复
-        last_used_source = None
-        for missing_num in missing_numbers:
-            target_path = os.path.join(library_dir, f"{missing_num}.jpg")
-            
-            # 如果只有一个源文件，没有选择，直接使用
-            if len(source_image_paths) == 1:
-                selected_source = source_image_paths[0]
-            else:
-                # 尝试选择一个与上次不同的源文件
-                available_sources = [s for s in source_image_paths if s != last_used_source]
-                
-                # 如果没有其他选择（可能上次用了唯一的源文件），则使用所有源
-                if not available_sources:
-                    available_sources = source_image_paths
-                    
-                # 随机选择一个源文件
-                selected_source = random.choice(available_sources)
-                
-            # 记录本次使用的源文件，用于下次比较
-            last_used_source = selected_source
-            
-            try:
-                if not os.path.exists(selected_source):
-                    logger.info(f"错误: 源文件 {selected_source} 在尝试复制前找不到了！")
-                    return False
-                    
-                shutil.copy(selected_source, target_path)
-                logger.info(f"信息: 已创建 {missing_num}.jpg (源自: {os.path.basename(selected_source)})")
-                
-            except Exception as e:
-                logger.info(f"错误: 复制文件 {selected_source} 到 {target_path} 时发生错误: {e}")
-                return False
-
-        logger.info(f"信息: {library_dir} 已成功补充所有缺失的图片，现在包含完整的 1-{required_items}.jpg")
-        return True
+    @staticmethod
+    def __detect_font_source(value: str) -> Optional[str]:
+        value = (value or "").strip()
+        if not value:
+            return None
+        if re.match(r'^https?://[^\s]+$', value, re.IGNORECASE):
+            return 'url'
+        if os.path.isabs(value) or value.startswith(('.', '~', '/')) or re.search(r'[\\/]', value):
+            return 'path'
+        return None
 
     def __get_fonts(self):
-        def detect_string_type(s: str):
-            if not s:
-                return None
-            s = s.strip()
+        """提前准备用户指定的字体。跟随风格的字体在生成时按标题内容取用，用不到的不会下载。"""
+        Path(self._font_path).mkdir(parents=True, exist_ok=True)
+        self._zh_font_path = self._en_font_path = ""
+        if self._zh_font_custom or self._zh_font_preset != AUTO_FONT:
+            self._zh_font_path = self.__resolve_font("主标题", self._zh_font_preset, self._zh_font_custom, "zh") or ""
+        if self._en_font_custom or self._en_font_preset != AUTO_FONT:
+            self._en_font_path = self.__resolve_font("副标题", self._en_font_preset, self._en_font_custom, "en") or ""
 
-            # 判断是否是 HTTP(S) 链接
-            if re.match(r'^https?://[^\s]+$', s, re.IGNORECASE):
-                return 'url'
+    def __resolve_font(self, lang: str, preset: str, custom: str, slot: str) -> Optional[Path]:
+        """取得一个字体文件：优先本地，其次下载，下载失败时退回备用字体。"""
+        font_dir = Path(self._font_path)
+        font_dir.mkdir(parents=True, exist_ok=True)
+        source = self.__detect_font_source(custom)
+        if source == 'path':
+            local = Path(custom.strip())
+            if validate_font_file(local):
+                logger.debug(f"{lang}字体: 使用本地指定路径 {local}")
+                return local
+            logger.warning(f"{lang}字体: 本地指定路径 {local} 无效或文件不存在")
 
-            # 判断是否像路径（包含 / 或 \，或以 ~、.、/ 开头）
-            if os.path.isabs(s) or s.startswith(('.', '~', '/')) or re.search(r'[\\/]', s):
-                return 'path'
-
+        if source == 'url':
+            url = custom.strip()
+            base_name = f"{slot}_custom"
+        elif preset in FONT_FILES:
+            url = FONT_BASE_URL + FONT_FILES[preset]
+            base_name = preset
+            _, _, paths, _ = self.__get_font_presets()
+            local = paths.get(preset)
+            if local and validate_font_file(Path(local)):
+                logger.debug(f"{lang}字体: 使用已有字体 {local}")
+                return Path(local)
+        else:
             return None
-        
-        font_dir_path = self._font_path
-        Path(font_dir_path).mkdir(parents=True, exist_ok=True)
 
-        _, _, zh_preset_paths, en_preset_paths = self.__get_font_presets()
+        target = font_dir / f"{base_name}{self.get_file_extension_from_url(url, fallback_ext='.ttf')}"
+        hash_file = font_dir / f"{base_name}_url.hash"
+        url_hash = hashlib.md5(url.encode()).hexdigest()
+        try:
+            changed = not hash_file.exists() or hash_file.read_text() != url_hash
+        except Exception as error:
+            logger.warning(f"读取哈希文件失败 {hash_file}: {error}。将重新下载。")
+            changed = True
+        is_valid = validate_font_file(target)
+        if not changed and is_valid:
+            return target
 
-        if not self._zh_font_preset:
-            self._zh_font_preset = "chaohei"
+        logger.info(f"{lang}字体需要下载: {url}")
+        if self.download_font_safely_with_timeout(url, target):
+            try:
+                hash_file.write_text(url_hash)
+            except Exception as error:
+                logger.error(f"写入哈希文件失败 {hash_file}: {error}")
+            return target
 
-        default_font_url = {
-            "chaohei": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/chaohei.ttf",
-            "yasong": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/yasong.ttf",
-            "EmblemaOne": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/EmblemaOne.woff2",
-            "Melete": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/Melete.otf",
-            "Phosphate": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/phosphate.ttf",
-            "JosefinSans": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/josefinsans.woff2",
-            "LilitaOne": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/lilitaone.woff2",
-            "Monoton": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/Monoton.woff2",
-            "Plaster": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/Plaster.woff2",
-        }
-        default_zh_url = default_font_url.get(self._zh_font_preset, "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/chaohei.ttf")
+        logger.critical(f"无法获取{lang}字体: {url}")
+        if is_valid:
+            logger.warning(f"下载失败，继续使用已有的字体文件 {target}")
+            return target
+        fallback = FONT_FALLBACKS.get(preset) if source != 'url' else None
+        if fallback:
+            return self.__fallback_font(fallback, FONT_BASE_URL + FONT_FILES[fallback])
+        return None
 
-        if not self._en_font_preset:
-            self._en_font_preset = "EmblemaOne"
-
-        default_en_url = default_font_url.get(self._en_font_preset, "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/fonts/EmblemaOne.woff2")
-        
-        log_prefix = "默认"
-        zh_custom_type = detect_string_type(self._zh_font_custom)
-        en_custom_type = detect_string_type(self._en_font_custom)
-        current_zh_font_url = self._zh_font_custom if zh_custom_type == 'url' else default_zh_url
-        current_en_font_url = self._en_font_custom if en_custom_type == 'url' else default_en_url
-        zh_local_path_config = self._zh_font_custom if zh_custom_type == 'path' else zh_preset_paths.get(self._zh_font_preset)
-        en_local_path_config = self._en_font_custom if en_custom_type == 'path' else en_preset_paths.get(self._en_font_preset)
-
-        downloaded_zh_font_base = f"{self._zh_font_preset}_custom" if zh_custom_type == 'url' else self._zh_font_preset
-        downloaded_en_font_base = f"{self._en_font_preset}_custom" if en_custom_type == 'url' else self._en_font_preset
-        hash_zh_file_name = f"{downloaded_zh_font_base}_url.hash"
-        hash_en_file_name = f"{downloaded_en_font_base}_url.hash"
-        final_zh_font_path_attr = "_zh_font_path"
-        final_en_font_path_attr = "_en_font_path"
-
-        logger.info(f"当前主标题字体URL: {current_zh_font_url} (本地路径: {zh_local_path_config})")
-
-        active_fonts_to_process = [
-            {
-                "lang": "主标题",
-                "url": current_zh_font_url,
-                "local_path_config": zh_local_path_config,
-                "download_base_name": downloaded_zh_font_base,
-                "hash_file_name": hash_zh_file_name,
-                "final_attr_name": final_zh_font_path_attr,
-                "fallback_ext": ".ttf"
-            },
-            {
-                "lang": "副标题",
-                "url": current_en_font_url,
-                "local_path_config": en_local_path_config,
-                "download_base_name": downloaded_en_font_base,
-                "hash_file_name": hash_en_file_name,
-                "final_attr_name": final_en_font_path_attr,
-                "fallback_ext": ".ttf"
-            }
-        ]
-
-
-        for font_info in active_fonts_to_process:
-            lang = font_info["lang"]
-            url = font_info["url"]
-            local_path_cfg = font_info["local_path_config"]
-            download_base = font_info["download_base_name"]
-            hash_filename = font_info["hash_file_name"]
-            final_attr = font_info["final_attr_name"]
-            fallback_ext = font_info["fallback_ext"]
-
-
-            extension = self.get_file_extension_from_url(url, fallback_ext=fallback_ext)
-            downloaded_font_file_path = Path(font_dir_path) / f"{download_base}{extension}"
-            hash_file_path = Path(font_dir_path) / hash_filename
-            
-            current_font_path = None
-            using_local_font = False
-            if local_path_cfg:
-                local_font_p = Path(local_path_cfg)
-                if validate_font_file(local_font_p):
-                    logger.info(f"{lang}字体: 使用本地指定路径 {local_font_p}")
-                    current_font_path = local_font_p
-                    using_local_font = True
-                else:
-                    logger.warning(f"{log_prefix}{lang}字体: 本地指定路径 {local_font_p} 无效或文件不存在。")
-
-            if not using_local_font:
-                url_hash = hashlib.md5(url.encode()).hexdigest()
-                url_has_changed = True
-                if hash_file_path.exists():
-                    try:
-                        if hash_file_path.read_text() == url_hash:
-                            url_has_changed = False
-                    except Exception as e:
-                        logger.warning(f"读取哈希文件失败 {hash_file_path}: {e}。将重新下载。")
-                
-                font_file_is_valid = validate_font_file(downloaded_font_file_path)
-
-                if url_has_changed or not font_file_is_valid:
-                    if url_has_changed:
-                        logger.info(f"{log_prefix}{lang}字体URL已更改或首次下载。")
-                    if not font_file_is_valid and downloaded_font_file_path.exists():
-                         logger.info(f"{log_prefix}{lang}字体文件 {downloaded_font_file_path} 无效或损坏，将重新下载。")
-                    elif not downloaded_font_file_path.exists():
-                         logger.info(f"{log_prefix}{lang}字体文件 {downloaded_font_file_path} 不存在，将下载。")
-
-                    # 使用安全的字体下载方法
-                    if self.download_font_safely_with_timeout(url, downloaded_font_file_path):
-                        try:
-                            hash_file_path.write_text(url_hash)
-                        except Exception as e:
-                            logger.error(f"写入哈希文件失败 {hash_file_path}: {e}")
-                        current_font_path = downloaded_font_file_path
-                    else:
-                        logger.critical(f"无法获取必要的{log_prefix}{lang}支持字体: {url}")
-                        if font_file_is_valid :
-                             logger.warning(f"下载失败，但找到一个已存在的（可能旧版本）有效字体文件 {downloaded_font_file_path}，将尝试使用。")
-                             current_font_path = downloaded_font_file_path
-                        else:
-                             current_font_path = None
-                else:
-                    logger.info(f"{log_prefix}{lang}字体: 使用已下载/缓存的有效字体 {downloaded_font_file_path}")
-                    current_font_path = downloaded_font_file_path
-            
-            # 安全设置字体路径
-            if current_font_path and current_font_path.exists():
-                setattr(self, final_attr, current_font_path)
-                status_log = '(本地路径)' if using_local_font else '(已下载/缓存)'
-                logger.info(f"{log_prefix}{lang}字体最终路径: {getattr(self,final_attr)} {status_log}")
-            else:
-                # 字体获取失败，设置为None并记录错误
-                setattr(self, final_attr, None)
-                logger.error(f"{log_prefix}{lang}字体获取失败，这可能导致封面生成失败")
-
-        # 检查是否所有必要的字体都已获取
-        if not self._zh_font_path or not self._en_font_path:
-            logger.critical("关键字体文件缺失，插件可能无法正常工作。请检查网络连接或手动下载字体文件。")
+    def __fallback_font(self, preset: str, url: str) -> Optional[Path]:
+        """默认字体下载失败时改用备用字体，优先用本地已有的文件。"""
+        _, _, paths, _ = self.__get_font_presets()
+        local = paths.get(preset)
+        if local and validate_font_file(Path(local)):
+            logger.warning(f"默认字体不可用，本次改用 {preset}，下次生成时会重新尝试下载")
+            return Path(local)
+        target = Path(self._font_path) / f"{preset}{self.get_file_extension_from_url(url, fallback_ext='.ttf')}"
+        if self.download_font_safely_with_timeout(url, target):
+            logger.warning(f"默认字体不可用，本次改用 {preset}，下次生成时会重新尝试下载")
+            return target
+        return None
 
     def __sanitize_filename(self, filename: str) -> str:
         """
@@ -4525,7 +3163,6 @@ class MediaCoverGenerator(_PluginBase):
             return "unknown"
 
         # 移除或替换不安全的字符
-        import re
         # 替换Windows和Unix系统中不允许的字符
         unsafe_chars = r'[<>:"/\\|?*]'
         safe_name = re.sub(unsafe_chars, '_', filename)
@@ -4564,20 +3201,6 @@ class MediaCoverGenerator(_PluginBase):
                 else:
                     self._resolution_config = ResolutionConfig(self._resolution)
 
-            # 检查字体文件
-            if not self._zh_font_path or not self._en_font_path:
-                logger.warning("字体文件缺失，尝试重新获取")
-                self.__get_fonts()
-
-            # 验证字体文件有效性
-            if self._zh_font_path and not validate_font_file(Path(self._zh_font_path)):
-                logger.warning("主标题字体文件无效，尝试重新下载")
-                return False
-
-            if self._en_font_path and not validate_font_file(Path(self._en_font_path)):
-                logger.warning("副标题字体文件无效，尝试重新下载")
-                return False
-
             logger.info("插件健康检查通过")
             return True
 
@@ -4590,7 +3213,7 @@ class MediaCoverGenerator(_PluginBase):
         带超时的安全字体下载方法，避免首次下载时阻塞过久
         """
         try:
-            logger.info(f"开始下载字体（超时限制: {timeout}秒）: {font_url}")
+            logger.info(f"开始下载字体（{timeout} 秒收不到数据算超时）: {font_url}")
             return self.download_font_safely(font_url, font_path, retries=1, timeout=timeout)
 
         except Exception as e:
@@ -4603,39 +3226,35 @@ class MediaCoverGenerator(_PluginBase):
         :param font_url: 字体文件URL
         :param font_path: 保存路径
         :param retries: 每种策略的最大重试次数（减少重试次数）
-        :param timeout: 下载超时时间
+        :param timeout: 读取超时（两次收到数据之间最多等多久）
         :return: 是否下载成功
         """
         logger.info(f"准备下载字体: {font_url} -> {font_path}")
 
-        # 确保在开始下载前删除任何可能存在的损坏文件
-        if font_path.exists():
-            try:
-                font_path.unlink()
-                logger.info(f"删除之前的字体文件以便重新下载: {font_path}")
-            except OSError as unlink_error:
-                logger.error(f"无法删除现有字体文件 {font_path}: {unlink_error}")
-                return False
-        
         # 使用优化的网络助手进行下载
         network_helper = NetworkHelper(timeout=timeout, max_retries=retries)
 
-        # 准备下载策略
+        # 准备下载策略：GitHub 镜像 → MoviePilot 的系统代理（PROXY_HOST）→ 直连，逐个尝试
         strategies = []
 
         # 判断是否为GitHub链接
-        is_github_url = "github.com" in font_url or "raw.githubusercontent.com" in font_url
+        is_github_url = bool(re.search(r"(^|\.)github\.com$|(^|\.)raw\.githubusercontent\.com$", urlparse(font_url).hostname or ""))
 
         # 对于GitHub链接，优先使用GitHub镜像站
-        if is_github_url and settings.GITHUB_PROXY:
+        if is_github_url and getattr(settings, "GITHUB_PROXY", None):
             github_proxy_url = f"{UrlUtils.standardize_base_url(settings.GITHUB_PROXY)}{font_url}"
-            strategies.append(("GitHub镜像站", github_proxy_url))
+            strategies.append(("GitHub镜像站", github_proxy_url, None))
+
+        # 和 MoviePilot 访问外网一样走系统代理
+        proxies = getattr(settings, "PROXY", None)
+        if proxies:
+            strategies.append(("系统代理", font_url, proxies))
 
         # 直接使用原始URL
-        strategies.append(("直连", font_url))
+        strategies.append(("直连", font_url, None))
 
         # 遍历所有策略
-        for strategy_name, target_url in strategies:
+        for strategy_name, target_url, strategy_proxies in strategies:
             logger.info(f"尝试使用策略：{strategy_name} 下载字体: {target_url}")
 
             # 创建临时文件路径
@@ -4643,7 +3262,7 @@ class MediaCoverGenerator(_PluginBase):
 
             try:
                 # 使用网络助手下载
-                if network_helper.download_file_sync(target_url, temp_path):
+                if network_helper.download_file_sync(target_url, temp_path, proxies=strategy_proxies):
                     # 验证下载的字体文件
                     if validate_font_file(temp_path):
                         # 验证通过后，将临时文件移动到正确位置
@@ -4665,17 +3284,9 @@ class MediaCoverGenerator(_PluginBase):
                         temp_path.unlink()
                     except OSError:
                         pass
-        
+
         # 所有策略都失败
         logger.error(f"所有下载策略均失败，无法下载字体，建议手动下载字体: {font_url}")
-        # 确保目标路径没有损坏的文件
-        if font_path.exists():
-            try:
-                font_path.unlink()
-                logger.info(f"已删除部分下载的文件: {font_path}")
-            except OSError as unlink_error:
-                logger.error(f"无法删除部分下载的文件 {font_path}: {unlink_error}")
-        
         return False
 
     def get_file_extension_from_url(self, url: str, fallback_ext: str = ".ttf") -> str:
@@ -4695,47 +3306,24 @@ class MediaCoverGenerator(_PluginBase):
         except Exception as e:
             logger.error(f"解析URL时出错 '{url}': {e}. 使用备用扩展名: {fallback_ext}")
             return fallback_ext
-        
-    def _validate_font_file(self, font_path: Path):
-        if not font_path or not font_path.exists() or not font_path.is_file():
-            return False
-        
-        try:
-            with open(font_path, "rb") as f:
-                header = f.read(4) 
-                if (header.startswith(b'\x00\x01\x00\x00') or
-                    header.startswith(b'OTTO') or
-                    header.startswith(b'true') or
-                    header.startswith(b'wOFF') or
-                    header.startswith(b'wOF2')):
-                    return True
-                if font_path.suffix.lower() == ".svg":
-                    f.seek(0)
-                    sample = f.read(100).decode(errors='ignore').strip()
-                    if sample.startswith('<svg') or sample.startswith('<?xml'):
-                        return True
-                if font_path.suffix.lower() == ".bdf":
-                    f.seek(0)
-                    sample = f.read(9).decode(errors='ignore')
-                    if sample == "STARTFONT":
-                        return True
-            logger.warning(f"字体文件存在但可能已损坏或格式无法识别: {font_path}")
-            return False
-        except Exception as e:
-            logger.warning(f"验证字体文件时出错 {font_path}: {e}")
-            return False
 
     def stop_service(self):
         """
         停止服务
         """
         try:
+            if self._update_lock.locked():
+                self._event.set()
+            with self._monitor_lock:
+                if self._monitor_timer:
+                    self._monitor_timer.cancel()
+                    self._monitor_timer = None
+                self._monitor_pending.clear()
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:
-                    self._event.set()
-                    self._scheduler.shutdown()
-                    self._event.clear()
+                    # 不等待正在运行的任务，否则保存配置会被长时间阻塞
+                    self._scheduler.shutdown(wait=False)
                 self._scheduler = None
         except Exception as e:
             logger.error(f"停止服务失败: {str(e)}")

@@ -31,13 +31,13 @@ class IYUUAutoSeed(_PluginBase):
     # 插件名称
     plugin_name = "IYUU自动辅种"
     # 插件描述
-    plugin_desc = "基于IYUU官方Api实现自动辅种。（本地补丁 2.23：支持 Gazelle 架构站点 authkey/torrent_pass + 架构自适应保存路径 + 可选 MD5 校验）"
+    plugin_desc = "基于IYUU官方Api实现自动辅种。"
     # 插件图标
     plugin_icon = "IYUU.png"
     # 插件版本
-    plugin_version = "2.28"
+    plugin_version = "2.29"
     # 插件作者
-    plugin_author = "jxxghp,CKun"
+    plugin_author = "jxxghp,CKun,Enderiose"
     # 作者主页
     author_url = "https://github.com/jxxghp"
     # 插件配置项ID前缀
@@ -97,6 +97,8 @@ class IYUUAutoSeed(_PluginBase):
     _linkblock = "Music"
     # 【v2.27】保存配置时清理全部硬链接映射（一次性开关）
     _linkclean = False
+    # 【v2.29】站点域名变体查询缓存（避免每个种子都重复查 DB）
+    _domain_cache = {}
     # 辅种缓存，出错的种子不再重复辅种，可清除
     _error_caches = []
     # 辅种缓存，辅种成功的种子，可清除
@@ -175,6 +177,8 @@ class IYUUAutoSeed(_PluginBase):
         self._auto_rechecked = set()
         # 【补丁】Gazelle 凭据缓存每次加载重置
         self._gazelle_keys = {}
+        # 【v2.29】域名变体缓存重置
+        self._domain_cache = {}
         self._md5check = bool(config.get("md5check")) if config else False
 
         # 启动定时任务 & 立即运行一次
@@ -1409,7 +1413,21 @@ class IYUUAutoSeed(_PluginBase):
         site_domain = StringUtils.get_url_domain(site_url)
         # 站点信息
         sites_helper = SitesHelper()
-        site_info = sites_helper.get_indexer(site_domain)
+        # 【v2.29】域名 fallback：IYUU 给的域名常带 www./api. 前缀（如 www.hdkyl.in、api.m-team.cc），
+        # 而 MP 里可能只写了裸域（hdkyl.in、m-team.cc）—— 精确匹配会失败，直接“没有维护该站点”。
+        site_info = None
+        matched_domain = None
+        for _domain in self.__domain_variants(site_domain):
+            _cached = self._domain_cache.get(_domain)
+            if _cached is None:
+                _cached = sites_helper.get_indexer(_domain)
+                self._domain_cache[_domain] = _cached
+            if _cached and _cached.get('url'):
+                site_info = _cached
+                matched_domain = _domain
+                break
+        if site_info and matched_domain and matched_domain != site_domain:
+            logger.info(f"站点域名 fallback 命中：{site_domain} -> {matched_domain}")
         if not site_info or not site_info.get('url'):
             logger.debug(f"没有维护种子对应的站点：{site_url}")
             return False
@@ -1580,6 +1598,36 @@ class IYUUAutoSeed(_PluginBase):
         except Exception as e:
             print(str(e))
             return ""
+
+    @staticmethod
+    def __domain_variants(domain: str) -> List[str]:
+        """
+        【v2.29】生成站点域名变体，用于兼容 IYUU 与 MP 域名前缀不一致。
+
+        实测踩到的：IYUU 返回 `www.hdkyl.in` / `www.agsvpt.com` / `api.m-team.cc`，
+        而 MP 里只写了 `hdkyl.in` / `agsvpt.com` / `m-team.cc` → 精确匹配失败，
+        这 3 个站的音乐候选（合计 202 条）全部辅不上。
+        """
+        if not domain:
+            return []
+        prefixes = ("www.", "api.", "pt.", "tracker.")
+        stripped = domain
+        for prefix in prefixes:
+            if domain.startswith(prefix):
+                stripped = domain[len(prefix):]
+                break
+        # 顺序即优先级：原样 → 去掉前缀 → 补 www. → 补 api.
+        out = [domain]
+        if stripped != domain:
+            out.append(stripped)
+        out.append("www." + stripped)
+        out.append("api." + stripped)
+        seen, result = set(), []
+        for item in out:
+            if item and item not in seen:
+                seen.add(item)
+                result.append(item)
+        return result
 
     def __get_gazelle_keys(self, site: dict) -> Tuple[str, str]:
         """

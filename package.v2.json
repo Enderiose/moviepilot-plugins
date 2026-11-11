@@ -468,17 +468,18 @@
     }
   },
   "MediaCoverGenerator": {
-    "name": "Emby媒体库封面生成",
-    "description": "生成媒体库动态/静态封面，支持 Emby/Jellyfin",
+    "name": "动态封面工坊",
+    "description": "让媒体库封面动起来：8 款 GIF 动态风格，Hills、yamby、小幻影视都能播放，支持 Emby/Jellyfin",
     "labels": "",
-    "version": "0.9.7",
-    "icon": "https://raw.githubusercontent.com/justzerock/MoviePilot-Plugins/main/icons/emby.png",
-    "author": "呀哈哈",
+    "version": "0.18.1",
+    "icon": "https://raw.githubusercontent.com/wio-ki/MoviePilot-Plugins/main/icons/animated-cover.png",
+    "author": "Kioo",
     "level": 1,
     "v3": false,
     "release": true,
     "history": {
-      "0.9.7": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+      "0.9.7": "备份快照 2026-11-07（源码原样，无上游 history 记录）",
+      "0.18.1": "2026-11-11 同步新上游 wio-ki/MoviePilot-Plugins（作者 Kioo）0.18.1：多文件结构（style/ utils/ ui*.py），8 款 GIF 动态风格；旧的 0.9.7（呀哈哈）单文件版被取代。"
     }
   }
 }
