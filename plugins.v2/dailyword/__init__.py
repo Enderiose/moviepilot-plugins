@@ -86,12 +86,15 @@ def _http_get(url: str, host: Optional[str] = None, timeout: int = 15):
         return None
 
 
-def _download_image(img_url: str) -> Optional[bytes]:
+def _download_image(img_url: str, budget: float = 20.0) -> Optional[bytes]:
     """
     下载图片，多源依次尝试，每个源重试 2 次：
       1. 七牛海外节点 http（主力，实测 8/8）
       2. 域名 https（兜底，国内节点成功率低）
     先试带压缩参数（约 30KB），失败再试原图。
+
+    budget：总耗时上限（秒）。全部源都失败时最坏 8 源 x 2 次 x 15s = 240s，
+    会拖死 MP 的 dashboard 接口，所以超过预算直接放弃、回退原始 URL。
     """
     try:
         path = urlsplit(img_url).path or "/"
@@ -106,9 +109,13 @@ def _download_image(img_url: str) -> Optional[bytes]:
     targets.append((f"https://{_IMAGE_HOST}{path}{_IMAGE_RESIZE}", None))
     targets.append((f"https://{_IMAGE_HOST}{path}", None))
 
+    deadline = time.time() + budget
     for url, host_header in targets:
         for _ in range(2):
-            res = _http_get(url, host_header)
+            if time.time() >= deadline:
+                logger.warning(f"每日一言图片下载超出 {budget:.0f}s 预算，放弃本次尝试")
+                return None
+            res = _http_get(url, host_header, timeout=10)
             if res is not None and res.status_code == 200 \
                     and res.content and len(res.content) > 2048:
                 return res.content
