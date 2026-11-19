@@ -332,14 +332,15 @@
     "name": "每日一言",
     "description": "在仪表板中显示每日一言卡片。",
     "labels": "",
-    "version": "1.2",
+    "version": "1.3",
     "icon": "Calibre_B.png",
     "author": "jxxghp",
     "level": 1,
     "v3": false,
     "release": true,
     "history": {
-      "1.2": "备份快照 2026-11-07（源码原样，无上游 history 记录）"
+      "1.2": "备份快照 2026-11-07（源码原样，无上游 history 记录）",
+      "1.3": "netstorm 2026-11-19：后端下载图片转 base64 内嵌（七牛国内节点 120.220.194.41 大面积连接重置，PC http 0/8、https 3/8；海外节点 154.41.93.240/.241 均 8/8）；失败只缓存 60 秒可重试（原版 lru_cache 会把失败结果锁死一整天）"
     }
   },
   "TorrentTransferEnhanced": {
