@@ -82,7 +82,9 @@ def _http_get(url: str, host: Optional[str] = None, timeout: int = 15):
         return session.get(url, headers=headers, timeout=timeout,
                            proxies={"http": None, "https": None})
     except Exception as err:
-        logger.debug(f"每日一言请求失败 {url}: {err}")
+        # netstorm 2026-11-26：原来只打 debug，LOG_LEVEL=INFO 下完全静默，
+        # 导致「无数据」时日志里查不到任何痕迹。改为 warning 便于定位。
+        logger.warning(f"每日一言请求失败 {url}: {err}")
         return None
 
 
