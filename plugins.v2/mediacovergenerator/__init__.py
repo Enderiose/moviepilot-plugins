@@ -126,6 +126,8 @@ SELECTION_PREVIEW_SIZE = 480
 PREVIEW_SIZE = (320, 180)
 LIBRARY_CACHE_SECONDS = 120
 THUMBNAIL_CACHE_SIZE = 256
+# 插件重载时暂存未执行的入库任务，避免延迟窗口内丢任务
+MONITOR_RESUME_KEY = "monitor_pending_resume"
 
 
 def _api_root(service) -> str:
@@ -446,6 +448,8 @@ class MediaCoverGenerator(_PluginBase):
                 self._scheduler.print_jobs()
                 self._scheduler.start()
 
+        self.__restore_monitor_pending()
+
     @staticmethod
     def __to_number(value, default, cast_type):
         """把表单值转成数字；空值或非法值返回默认值。"""
@@ -596,6 +600,50 @@ class MediaCoverGenerator(_PluginBase):
             "covers_page_history_limit": self._covers_page_history_limit,
             "style_naming_v2": True,
         })
+
+    def __restore_monitor_pending(self):
+        """插件重载会 cancel 定时器，这里把上次没跑完的入库任务补回来。"""
+        try:
+            pending = self.get_data(MONITOR_RESUME_KEY) or []
+        except Exception as error:
+            logger.warning(f"读取入库任务暂存失败: {error}")
+            return
+        if not pending:
+            return
+        self.save_data(MONITOR_RESUME_KEY, [])
+        if not self._enabled or not self._transfer_monitor:
+            logger.info("插件未启用或未开启入库监控，丢弃暂存的入库任务")
+            return
+        # 内核链路（message.py / transhandler.py）要求 type 是 MediaType 枚举，
+        # 因此这里必须用 app.core.context.MediaInfo（dataclass），
+        # 而不是 app.schemas.MediaInfo（API 传输版，type 是 str）。
+        from app.core.context import MediaInfo as CoreMediaInfo
+        from app.schemas.types import MediaType
+
+        for item in pending:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title") or ""
+            if not title:
+                continue
+            raw_type = item.get("type")
+            try:
+                media_type = MediaType(raw_type) if raw_type else None
+            except ValueError:
+                media_type = None
+            mediainfo = CoreMediaInfo(
+                title=title,
+                year=item.get("year"),
+                type=media_type,
+                tmdb_id=item.get("tmdb_id"),
+            )
+            label = mediainfo.title_year or title
+            logger.info(f"恢复上次未完成的入库任务：{label}")
+            self.__schedule_monitor(
+                f"transfer:{label}",
+                lambda mi=mediainfo: self.__handle_transfer(mi),
+                item,
+            )
 
     def get_state(self) -> bool:
         return self._enabled
@@ -1654,14 +1702,15 @@ class MediaCoverGenerator(_PluginBase):
         # 全量更新可能持续很久，不占用事件线程
         threading.Thread(target=run, name="MediaCoverGenerator", daemon=True).start()
 
-    def __schedule_monitor(self, key: str, handler) -> None:
+    def __schedule_monitor(self, key: str, handler, resume: Optional[Dict[str, Any]] = None) -> None:
         """
         入库事件先进入队列，延迟结束后统一处理。
 
         批量入库时事件线程不会被长时间占用，同一媒体的多次入库也只处理一次。
+        resume 是可序列化的任务描述，插件重载时用它把任务补回来。
         """
         with self._monitor_lock:
-            self._monitor_pending[key] = handler
+            self._monitor_pending[key] = (handler, resume or {})
             if self._monitor_timer is None:
                 logger.info(f"将在 {self._delay} 秒后更新入库媒体所在媒体库的封面")
                 timer = threading.Timer(self._delay, self.__flush_monitor)
@@ -1671,11 +1720,17 @@ class MediaCoverGenerator(_PluginBase):
 
     def __flush_monitor(self):
         with self._monitor_lock:
-            handlers = list(self._monitor_pending.values())
+            entries = list(self._monitor_pending.values())
             self._monitor_pending.clear()
             self._monitor_timer = None
+        # 任务已消费，清掉重载时可能留下的暂存
+        try:
+            if self.get_data(MONITOR_RESUME_KEY):
+                self.save_data(MONITOR_RESUME_KEY, [])
+        except Exception:
+            pass
         self._monitor_batch_updated = set()
-        for handler in handlers:
+        for handler, _resume in entries:
             if not self._enabled or not self._transfer_monitor:
                 return
             try:
@@ -1696,7 +1751,15 @@ class MediaCoverGenerator(_PluginBase):
         mediainfo: MediaInfo = event_data.get("mediainfo")
         if not mediainfo:
             return
-        self.__schedule_monitor(f"transfer:{mediainfo.title_year}", lambda: self.__handle_transfer(mediainfo))
+        resume = {
+            "title": mediainfo.title,
+            "year": mediainfo.year,
+            "title_year": mediainfo.title_year,
+            "type": getattr(mediainfo.type, "value", mediainfo.type),
+            "tmdb_id": mediainfo.tmdb_id,
+        }
+        self.__schedule_monitor(f"transfer:{mediainfo.title_year}", lambda: self.__handle_transfer(mediainfo),
+                                resume)
 
     def __handle_transfer(self, mediainfo: MediaInfo):
         try:
@@ -3339,7 +3402,14 @@ class MediaCoverGenerator(_PluginBase):
                 if self._monitor_timer:
                     self._monitor_timer.cancel()
                     self._monitor_timer = None
+                resumes = [item[1] for item in self._monitor_pending.values() if item[1]]
                 self._monitor_pending.clear()
+            if resumes:
+                try:
+                    self.save_data(MONITOR_RESUME_KEY, resumes)
+                    logger.info(f"插件停止：{len(resumes)} 个入库任务已暂存，重载后自动补跑")
+                except Exception as error:
+                    logger.warning(f"暂存入库任务失败: {error}")
             if self._scheduler:
                 self._scheduler.remove_all_jobs()
                 if self._scheduler.running:

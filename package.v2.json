@@ -483,7 +483,7 @@
       "0.9.7": "备份快照 2026-11-07（源码原样，无上游 history 记录）",
       "0.18.1": "2026-11-11 同步新上游 wio-ki/MoviePilot-Plugins（作者 Kioo）0.18.1：多文件结构（style/ utils/ ui*.py），8 款 GIF 动态风格；旧的 0.9.7（呀哈哈）单文件版被取代。",
       "0.18.2": "2026-11-27 同步上游 0.18.2（新增 _api_root() 统一拼接 [HOST]，修复 Jellyfin 反代子路径）。本地修复两处 V2 兼容问题：① __supports_anonymous_route 的 find_spec 包 try/except —— V2 没有 app.adapters 包时 find_spec 抛 ModuleNotFoundError（不是返回 None），会导致 get_api() 整体失败、插件全部 API 路由不注册、前端历史记录一直转圈；② 新增 PluginReload 监听，热重载后自调 register_plugin_api —— MoviePilot 的 reload_plugin 只做 stop+start+发事件，不会重挂 FastAPI 路由。",
-      "0.20.0": "2026-11-27 本地分叉版本号（上游 wio-ki 最新仍为 0.18.2）。跳版原因：MoviePilot 按版本号判断是否可更新，与上游同号时会被市场更新直接覆盖、本地补丁丢失；提到 0.20.0 后市场不再认为「有新版本」。功能上 = 上游 0.18.2 + 上述两处 V2 兼容修复，无其它改动。"
+      "0.20.0": "2026-11-27 本地分叉版本号（上游 wio-ki 最新仍为 0.18.2）。跳版原因：MoviePilot 按版本号判断是否可更新，与上游同号时会被市场更新直接覆盖、本地补丁丢失；提到 0.20.0 后市场不再认为「有新版本」。功能上 = 上游 0.18.2 + 本地修复，无其它改动。本地修复共三处：① __supports_anonymous_route 的 find_spec 包 try/except（V2 无 app.adapters 包时 find_spec 抛 ModuleNotFoundError，导致 get_api() 整体失败、全部 API 路由不注册、历史记录卡死）；② 新增 PluginReload 监听，热重载后自调 register_plugin_api（reload_plugin 只做 stop+start+发事件，不会重挂 FastAPI 路由）；③ 入库延迟任务持久化：_monitor_pending 原本是纯内存态，任何重载（更新/保存配置）都会 cancel 定时器 + clear 队列，延迟窗口内的任务永久丢失且不补跑。现改为 stop_service 时把任务序列化到 plugin_data(monitor_pending_resume)，init_plugin 末尾恢复并重新排期。恢复时用 app.core.context.MediaInfo（type 为 MediaType 枚举），不能用 app.schemas.MediaInfo（type 为 str），否则内核 message.py / transhandler.py 取 .value 会报错。"
     }
   }
 }
